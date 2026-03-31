@@ -1,0 +1,36 @@
+[tool.poetry]
+name = "argus-log-intelligence-platform"
+version = "0.1.0"
+description = "Log intelligence platform for parsing, streaming, and anomaly detection"
+authors = ["Mark Christian Anub"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+torch = "^2.1.0"
+transformers = "^4.37.0"
+drain3 = "^0.9.11"
+faust-streaming = "^0.10.0"
+elasticsearch = "^8.11.0"
+redis = { extras = ["hiredis"], version = "^5.0.0" }
+fastapi = "^0.109.0"
+uvicorn = { extras = ["standard"], version = "^0.27.0" }
+mlflow = "^2.10.0"
+pydantic = "^2.6.0"
+pydantic-settings = "^2.1.0"
+pandas = "^2.1.0"
+pyarrow = "^14.0.0"
+shap = "^0.44.0"
+loguru = "^0.7.2"
+python-dotenv = "^1.0.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.4.0"
+pytest-asyncio = "^0.23.0"
+jupyter = "^1.0.0"
+black = "^23.0.0"
+
+[build-system]
+requires = ["poetry-core>=2.0.0"]
+build-backend = "poetry.core.masonry.api"

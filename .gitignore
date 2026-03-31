@@ -1,0 +1,18 @@
+data/
+checkpoints/
+.env
+__pycache__/
+*.pyc
+.venv/
+*.pt
+*.ckpt
+mlruns/
+*.log
+
+# Common Poetry and test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+build/
+dist/
