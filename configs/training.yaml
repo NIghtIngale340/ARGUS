@@ -1,0 +1,28 @@
+pretraining:
+  mask_probability: 0.15
+  mask_strategy:
+    mask_token: 0.80
+    random_token: 0.10
+    unchanged: 0.10
+  optimizer: "AdamW"
+  learning_rate: 1.0e-4
+  warmup_steps: 10000
+  batch_size: 64
+  max_epochs: 50
+  early_stop_patience: 5
+  loss_threshold: 0.05
+
+finetuning:
+  num_classes: 45          
+  learning_rate: 5.0e-5
+  batch_size: 32
+  max_epochs: 20
+  contrastive_weight: 0.1
+  temperature: 0.07
+
+data:
+  lanl_pretrain_days: [1, 50]
+  lanl_finetune_days: [51, 55]
+  lanl_test_days: [56, 58]
+  min_session_events: 3
+  max_session_events: 500

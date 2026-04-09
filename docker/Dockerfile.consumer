@@ -1,0 +1,33 @@
+FROM python:3.11-slim AS builder
+
+ENV POETRY_VERSION=1.8.3 \
+    POETRY_HOME=/opt/poetry \
+    POETRY_VIRTUALENVS_CREATE=false \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/poetry/bin:/opt/venv/bin:$PATH"
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential && rm -rf /var/lib/apt/lists/*
+RUN python -m venv /opt/venv && pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir poetry==${POETRY_VERSION}
+
+WORKDIR /app
+
+COPY pyproject.toml poetry.lock ./
+RUN poetry install --only main --no-interaction --no-ansi
+
+COPY src ./src
+COPY configs ./configs
+
+FROM python:3.11-slim AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+
+COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /app/src ./src
+COPY --from=builder /app/configs ./configs
+
+CMD ["faust", "-A", "src.inference.kafka_consumer", "worker", "-l", "info"]

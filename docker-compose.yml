@@ -1,0 +1,204 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.4
+    environment:
+      discovery.type: single-node
+      xpack.security.enabled: "false"
+      xpack.security.http.ssl.enabled: "false"
+      ES_JAVA_OPTS: -Xms1g -Xmx1g
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow&timeout=1s >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.4
+    environment:
+      SERVER_NAME: kibana
+      SERVER_HOST: 0.0.0.0
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+    ports:
+      - "5601:5601"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5601/api/status >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    environment:
+      ZOOKEEPER_CLIENT_PORT: "2181"
+      ZOOKEEPER_TICK_TIME: "2000"
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr,stat"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    environment:
+      KAFKA_BROKER_ID: "1"
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+
+  redis:
+    image: redis:7.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.12.2
+    command: ["mlflow", "server", "--host", "0.0.0.0", "--port", "5000", "--backend-store-uri", "/mlflow/mlruns", "--default-artifact-root", "/mlflow/artifacts"]
+    volumes:
+      - mlflow_data:/mlflow
+    ports:
+      - "5000:5000"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.11.4
+    command: ["logstash", "-f", "/usr/share/logstash/pipeline/argus.conf"]
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./docker/logstash/argus.conf:/usr/share/logstash/pipeline/argus.conf:ro
+      - logstash_data:/usr/share/logstash/data
+    ports:
+      - "5044:5044"
+      - "9600:9600"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9600/_node/pipelines >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.api
+    environment:
+      ES_URL: http://elasticsearch:9200
+      KAFKA_BOOTSTRAP: kafka:9092
+      REDIS_URL: redis://redis:6379/0
+      MLFLOW_URI: http://mlflow:5000
+      LOG_LEVEL: INFO
+      ENV: development
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mlflow:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  consumer:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.consumer
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      REDIS_URL: redis://redis:6379/0
+      MLFLOW_URI: http://mlflow:5000
+      ES_URL: http://elasticsearch:9200
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - argus-net
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import subprocess, sys; out = subprocess.check_output(['ps', '-ef'], text=True); sys.exit(0 if 'faust' in out else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+
+volumes:
+  esdata:
+  zookeeper_data:
+  kafka_data:
+  redis_data:
+  mlflow_data:
+  logstash_data:
+
+networks:
+  argus-net:
+    driver: bridge

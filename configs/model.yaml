@@ -1,0 +1,21 @@
+model: 
+  name: "ARGUS"
+  hidden_size: 256
+  num_layers: 6
+  num_heads: 8
+  max_seq_len: 512
+  dropout: 0.1
+  vocab_size: 5000
+embedding:
+  event_id_dim: 64
+  user_dim: 32
+  host_dim: 32
+  delta_time_dim: 16
+  template_dim: 64
+  position_dim: 256
+special_tokens:
+  cls: "[CLS]"
+  sep: "[SEP]"
+  mask: "[MASK]"
+  pad: "[PAD]"
+  unk: "[UNK]"

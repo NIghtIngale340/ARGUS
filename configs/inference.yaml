@@ -1,0 +1,41 @@
+scoring:
+  reconstruction_weight: 0.6
+  embedding_weight: 0.4
+  default_threshold: 0.75
+
+severity:
+  critical: 0.90
+  high: 0.75
+  medium: 0.50
+  low: 0.0
+
+ueba:
+  decay_factor: 0.95
+  anomaly_weight: 0.05
+  severity_formula:
+    anomaly_weight: 0.5
+    user_risk_weight: 0.3
+    technique_weight: 0.2
+
+mitre_severity_bonus:
+  T1486: 0.4   # Ransomware
+  T1490: 0.4   # Inhibit recovery
+  T1003: 0.3   # Credential dump
+  T1053: 0.2   # Persistence
+  T1543: 0.2   # System process
+  T1018: 0.1   # Discovery
+  T1083: 0.1   # File discovery
+
+alert_thresholds:
+  p1_percentile: 99.9
+  p2_percentile: 99.0
+  p3_percentile: 97.0
+
+elasticsearch:
+  host: "${ES_HOST:localhost}"
+  port: 9200
+  indices:
+    raw_logs: "logs-raw-*"
+    sessions: "logs-sessions-*"
+    alerts: "alerts-*"
+    risk_profiles: "risk-profiles-*"
