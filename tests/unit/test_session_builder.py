@@ -87,3 +87,41 @@ def test_sessions_are_truncated_to_last_max_tokens() -> None:
 def test_invalid_builder_configuration_raises() -> None:
     with pytest.raises(ValueError):
         SessionBuilder(window_mins=0)
+
+
+def test_sensitive_event_fields_are_removed_and_event_id_is_backfilled() -> None:
+    builder = SessionBuilder(window_mins=30, stride_mins=15, min_events=1, timestamp_unit="seconds")
+    events = [
+        {
+            "user": "alice",
+            "host": "pc1",
+            "src_user": "alice",
+            "dst_user": "bob",
+            "src_computer": "pc1",
+            "dst_computer": "pc2",
+            "template_params": ["alice", "pc1"],
+            "template_id": 42,
+            "auth_type": "Kerberos",
+            "logon_type": "Network",
+            "time": 0,
+        }
+    ]
+
+    sessions = builder.build_sessions(events)
+
+    assert len(sessions) == 1
+    event = sessions[0].events[0]
+    assert event["event_id"] == "42"
+    assert event["auth_type"] == "Kerberos"
+    assert event["logon_type"] == "Network"
+
+    for key in (
+        "user",
+        "host",
+        "src_user",
+        "dst_user",
+        "src_computer",
+        "dst_computer",
+        "template_params",
+    ):
+        assert key not in event

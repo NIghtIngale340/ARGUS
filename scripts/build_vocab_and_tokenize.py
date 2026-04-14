@@ -1,4 +1,5 @@
 import argparse
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping
 import sys
@@ -10,6 +11,13 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from src.parsing.log_tokenizer import LogTokenizer
 from src.parsing.vocab_builder import VocabBuilder
 
+SPLIT_DAY_RANGES = {
+    "train": (1, 40),
+    "val": (41, 50),
+    "test": (51, 58),
+    "all": (1, 58),
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -20,6 +28,13 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="data/sessions/day_*.parquet",
         help="Glob pattern for input parquet session files",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default="train",
+        choices=tuple(SPLIT_DAY_RANGES.keys()),
+        help="Time-based split to process: train=days 1-40, val=41-50, test=51-58",
     )
     parser.add_argument(
         "--vocab-out",
@@ -99,6 +114,29 @@ def _validate_vocab_size(vocab: Dict[str, int], min_expected: int = 6) -> None:
         )
 
 
+def _extract_day_from_shard_name(parquet_path: Path) -> int:
+    match = re.search(r"day_(\d+)\.parquet$", parquet_path.name)
+    if not match:
+        raise ValueError(
+            f"Unable to infer day index from shard name: {parquet_path.name}. "
+            "Expected format: day_XX.parquet"
+        )
+    return int(match.group(1))
+
+
+def _filter_paths_for_split(parquet_paths: Iterable[Path], split: str) -> List[Path]:
+    if split == "all":
+        return list(parquet_paths)
+
+    start_day, end_day = SPLIT_DAY_RANGES[split]
+    filtered: List[Path] = []
+    for parquet_path in parquet_paths:
+        day_idx = _extract_day_from_shard_name(parquet_path)
+        if start_day <= day_idx <= end_day:
+            filtered.append(parquet_path)
+    return filtered
+
+
 def load_sessions(parquet_paths: Iterable[Path]) -> List[Dict[str, Any]]:
     sessions: List[Dict[str, Any]] = []
 
@@ -120,11 +158,22 @@ def main() -> None:
     if args.max_len < 3:
         raise ValueError("--max-len must be >= 3")
 
-    parquet_paths = sorted(Path().glob(args.sessions_glob))
-    if not parquet_paths:
+    all_parquet_paths = sorted(Path().glob(args.sessions_glob))
+    if not all_parquet_paths:
         raise FileNotFoundError(f"No session parquet files found for pattern: {args.sessions_glob}")
 
-    print(f"Found {len(parquet_paths)} parquet shard(s).")
+    parquet_paths = _filter_paths_for_split(all_parquet_paths, split=args.split)
+    if not parquet_paths:
+        raise RuntimeError(
+            f"No parquet shards matched split '{args.split}' ({SPLIT_DAY_RANGES[args.split][0]}-"
+            f"{SPLIT_DAY_RANGES[args.split][1]})."
+        )
+
+    split_start, split_end = SPLIT_DAY_RANGES[args.split]
+    print(
+        f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' "
+        f"(days {split_start}-{split_end})."
+    )
     sessions = load_sessions(parquet_paths)
     if not sessions:
         raise RuntimeError("Loaded 0 sessions from parquet files.")

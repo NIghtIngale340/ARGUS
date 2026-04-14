@@ -5,6 +5,20 @@ from typing import Any, Dict, List, Optional, Tuple
 
 Event = Dict[str, Any]
 
+SENSITIVE_EVENT_FIELDS = {
+    "user",
+    "host",
+    "username",
+    "source_user",
+    "source_host",
+    "src_user",
+    "dst_user",
+    "src_host",
+    "src_computer",
+    "dst_computer",
+    "template_params",
+}
+
 
 @dataclass
 class Session:
@@ -83,6 +97,17 @@ class SessionBuilder:
         )
         return self._hash_id(raw_user), self._hash_id(raw_host)
 
+    def _sanitize_event(self, event: Event) -> Event:
+        sanitized = dict(event)
+
+        if "event_id" not in sanitized or sanitized.get("event_id") in {None, ""}:
+            sanitized["event_id"] = str(sanitized.get("template_id", "UNK"))
+
+        for field in SENSITIVE_EVENT_FIELDS:
+            sanitized.pop(field, None)
+
+        return sanitized
+
     def _build_group_sessions(self, user_id: str, host_id: str, events: List[Event]) -> List[Session]:
         if not events:
             return []
@@ -116,6 +141,7 @@ class SessionBuilder:
                 window_events = events[start_idx:end_idx]
                 if event_count > self.max_tokens:
                     window_events = window_events[-self.max_tokens :]
+                window_events = [self._sanitize_event(event) for event in window_events]
 
                 sessions.append(
                     Session(

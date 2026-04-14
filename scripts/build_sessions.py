@@ -1,16 +1,21 @@
 import argparse
+import hashlib
+import json
+import shutil
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Sequence, Tuple
-import sys
+from typing import Dict, List, Optional, TextIO
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 from tqdm import tqdm
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.parsing.drain3_parser import LogParser
-from src.parsing.session_builder import Session, SessionBuilder
+from src.parsing.session_builder import SessionBuilder
 
 LANL_AUTH_COLUMNS_9 = (
     "time",
@@ -44,6 +49,7 @@ class BuildStats:
     skipped_lines: int = 0
     processed_days: int = 0
     written_sessions: int = 0
+    bucketed_events: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         default="data/drain3_state.bin",
         help="Path to Drain3 parser state snapshot",
     )
+    arg_parser.add_argument(
+        "--bucket-count",
+        type=int,
+        default=256,
+        help="Disk bucket count used for memory-safe day processing (higher reduces peak RAM).",
+    )
     return arg_parser.parse_args()
 
 
@@ -78,6 +90,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--min-events must be > 0")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be > 0")
+    if args.bucket_count <= 0:
+        raise ValueError("--bucket-count must be > 0")
 
 
 def get_day_index(timestamp_seconds: int) -> int:
@@ -131,68 +145,92 @@ def enrich_with_drain3(event: Dict[str, object], log_parser: LogParser) -> Dict[
     try:
         template_id, template_params = log_parser.parse(build_template_message(event))
         enriched["template_id"] = template_id
+        enriched["event_id"] = str(template_id)
         enriched["template_params"] = template_params
     except Exception:
         # Keep processing even if template extraction fails for a malformed line.
         enriched["template_id"] = -1
+        enriched["event_id"] = "UNK"
         enriched["template_params"] = []
     return enriched
 
 
-def iter_events_grouped_by_day(
-    input_path: Path,
-    start_day: int,
-    end_day: int,
-    log_parser: LogParser,
-    stats: BuildStats,
-) -> Iterator[Tuple[int, List[Dict[str, object]]]]:
-    current_day: Optional[int] = None
-    current_events: List[Dict[str, object]] = []
-
-    with input_path.open("r", encoding="utf-8", errors="replace") as infile:
-        for line in tqdm(infile, desc="Reading auth.txt", unit="lines"):
-            stats.total_lines += 1
-
-            event = parse_lanl_auth_line(line)
-            if event is None:
-                stats.skipped_lines += 1
-                continue
-
-            stats.parsed_lines += 1
-            day = get_day_index(int(event["time"]))
-
-            if day < start_day:
-                continue
-            if day > end_day:
-                break
-
-            if current_day is None:
-                current_day = day
-
-            if day != current_day:
-                yield current_day, current_events
-                current_day = day
-                current_events = []
-
-            current_events.append(enrich_with_drain3(event, log_parser))
-
-    if current_day is not None:
-        yield current_day, current_events
+def _bucket_key(event: Dict[str, object]) -> str:
+    user = str(event.get("src_user", event.get("user", "UNKNOWN")))
+    host = str(event.get("src_computer", event.get("host", "UNKNOWN")))
+    return f"{user}|{host}"
 
 
-def write_day_sessions(day: int, sessions: Sequence[Session], out_dir: Path) -> int:
-    if not sessions:
-        return 0
+def _bucket_index(event: Dict[str, object], bucket_count: int) -> int:
+    digest = hashlib.blake2b(_bucket_key(event).encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="big") % bucket_count
 
-    session_dicts = [asdict(session) for session in sessions]
+
+def _close_bucket_handles(handles: Dict[int, TextIO]) -> None:
+    for handle in handles.values():
+        handle.close()
+    handles.clear()
+
+
+def _write_event_to_bucket(
+    day_dir: Path,
+    handles: Dict[int, TextIO],
+    event: Dict[str, object],
+    bucket_count: int,
+) -> None:
+    idx = _bucket_index(event, bucket_count)
+    handle = handles.get(idx)
+    if handle is None:
+        bucket_path = day_dir / f"bucket_{idx:04d}.jsonl"
+        handle = bucket_path.open("a", encoding="utf-8")
+        handles[idx] = handle
+    handle.write(json.dumps(event, separators=(",", ":"), ensure_ascii=True))
+    handle.write("\n")
+
+
+def _write_day_sessions_from_buckets(
+    day: int,
+    day_dir: Path,
+    out_dir: Path,
+    builder: SessionBuilder,
+) -> tuple[int, int]:
     output_file = out_dir / f"day_{day:02d}.parquet"
-    pd.DataFrame(session_dicts).to_parquet(
-        output_file,
-        engine="pyarrow",
-        compression="snappy",
-        index=False,
-    )
-    return len(session_dicts)
+    if output_file.exists():
+        output_file.unlink()
+
+    writer: Optional[pq.ParquetWriter] = None
+    total_day_events = 0
+    total_day_sessions = 0
+
+    bucket_files = sorted(day_dir.glob("bucket_*.jsonl"))
+    for bucket_file in tqdm(bucket_files, desc=f"Day {day:02d} buckets", leave=False):
+        events: List[Dict[str, object]] = []
+        with bucket_file.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                events.append(json.loads(line))
+
+        if not events:
+            continue
+
+        total_day_events += len(events)
+        sessions = builder.build_sessions(events)
+        if not sessions:
+            continue
+
+        total_day_sessions += len(sessions)
+        dataframe = pd.DataFrame([asdict(session) for session in sessions])
+        table = pa.Table.from_pandas(dataframe, preserve_index=False)
+
+        if writer is None:
+            writer = pq.ParquetWriter(str(output_file), table.schema, compression="snappy")
+        writer.write_table(table)
+
+    if writer is not None:
+        writer.close()
+
+    return total_day_events, total_day_sessions
 
 
 def main() -> None:
@@ -225,26 +263,88 @@ def main() -> None:
     )
 
     stats = BuildStats()
-    print(f"Building sessions for LANL days {args.start_day} to {args.end_day}...")
+    print(
+        f"Building sessions for LANL days {args.start_day} to {args.end_day} "
+        f"(bucket_count={args.bucket_count})..."
+    )
 
-    for day, day_events in iter_events_grouped_by_day(
-        input_path=input_path,
-        start_day=args.start_day,
-        end_day=args.end_day,
-        log_parser=log_parser,
-        stats=stats,
-    ):
+    temp_root = out_dir / ".tmp_session_buckets"
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    current_day: Optional[int] = None
+    current_day_dir: Optional[Path] = None
+    bucket_handles: Dict[int, TextIO] = {}
+
+    def flush_current_day() -> None:
+        nonlocal current_day, current_day_dir
+        if current_day is None or current_day_dir is None:
+            return
+
+        _close_bucket_handles(bucket_handles)
+        day_events, day_sessions = _write_day_sessions_from_buckets(
+            day=current_day,
+            day_dir=current_day_dir,
+            out_dir=out_dir,
+            builder=builder,
+        )
         stats.processed_days += 1
-        sessions = builder.build_sessions(day_events)
-        written = write_day_sessions(day, sessions, out_dir)
-        stats.written_sessions += written
-        print(f"Day {day:02d}: events={len(day_events):,}, sessions={written:,}")
+        stats.written_sessions += day_sessions
+        print(f"Day {current_day:02d}: events={day_events:,}, sessions={day_sessions:,}")
+        shutil.rmtree(current_day_dir, ignore_errors=True)
+        current_day = None
+        current_day_dir = None
+
+    try:
+        with input_path.open("r", encoding="utf-8", errors="replace") as infile:
+            for line in tqdm(infile, desc="Reading auth.txt", unit="lines"):
+                stats.total_lines += 1
+
+                event = parse_lanl_auth_line(line)
+                if event is None:
+                    stats.skipped_lines += 1
+                    continue
+
+                stats.parsed_lines += 1
+                day = get_day_index(int(event["time"]))
+
+                if day < args.start_day:
+                    continue
+                if day > args.end_day:
+                    break
+
+                if current_day is None:
+                    current_day = day
+                    current_day_dir = temp_root / f"day_{current_day:02d}"
+                    current_day_dir.mkdir(parents=True, exist_ok=True)
+
+                if day != current_day:
+                    flush_current_day()
+                    current_day = day
+                    current_day_dir = temp_root / f"day_{current_day:02d}"
+                    current_day_dir.mkdir(parents=True, exist_ok=True)
+
+                enriched = enrich_with_drain3(event, log_parser)
+                _write_event_to_bucket(
+                    day_dir=current_day_dir,
+                    handles=bucket_handles,
+                    event=enriched,
+                    bucket_count=args.bucket_count,
+                )
+                stats.bucketed_events += 1
+
+        flush_current_day()
+    finally:
+        _close_bucket_handles(bucket_handles)
+        shutil.rmtree(temp_root, ignore_errors=True)
 
     log_parser.save_state(args.parser_state)
     print("\nBuild complete.")
     print(f"- Total lines read: {stats.total_lines:,}")
     print(f"- Parsed lines: {stats.parsed_lines:,}")
     print(f"- Skipped lines: {stats.skipped_lines:,}")
+    print(f"- Bucketed events: {stats.bucketed_events:,}")
     print(f"- Days processed: {stats.processed_days:,}")
     print(f"- Sessions written: {stats.written_sessions:,}")
 
