@@ -1,0 +1,126 @@
+import json
+from pathlib import Path
+
+import pytest
+
+from src.parsing.log_tokenizer import LogTokenizer
+
+
+def _make_event(event_id: str, auth_type: str = "Kerberos", logon_type: str = "Network"):
+    return {
+        "event_id": event_id,
+        "auth_type": auth_type,
+        "logon_type": logon_type,
+    }
+
+
+@pytest.fixture
+def vocab_path(tmp_path: Path) -> Path:
+    vocab = {
+        "[CLS]": 0,
+        "[SEP]": 1,
+        "[MASK]": 2,
+        "[PAD]": 3,
+        "[UNK]": 4,
+        "4624_Kerberos_Network": 5,
+        "4768_NTLM_Interactive": 6,
+        "e0_A_B": 10,
+        "e1_A_B": 11,
+        "e2_A_B": 12,
+        "e3_A_B": 13,
+        "e4_A_B": 14,
+        "e5_A_B": 15,
+    }
+
+    path = tmp_path / "vocab.json"
+    path.write_text(json.dumps(vocab), encoding="utf-8")
+    return path
+
+
+def test_encode_event_known_and_unknown(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+
+    known = _make_event("4624", "Kerberos", "Network")
+    unknown = _make_event("9999", "Kerberos", "Network")
+
+    assert tokenizer.encode_event(known) == 5
+    assert tokenizer.encode_event(unknown) == tokenizer.unk_token
+
+
+def test_tokenize_adds_special_tokens_and_padding(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    session = {
+        "events": [
+            _make_event("4624", "Kerberos", "Network"),
+            _make_event("4768", "NTLM", "Interactive"),
+        ]
+    }
+
+    token_ids = tokenizer.tokenize(session)
+
+    assert len(token_ids) == 8
+    assert token_ids[0] == tokenizer.cls_token
+    assert token_ids[1:4] == [5, 6, tokenizer.sep_token]
+    assert token_ids[4:] == [tokenizer.pad_token] * 4
+
+
+def test_tokenize_truncates_to_last_events(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=6)
+    session = {
+        "events": [
+            _make_event("e0", "A", "B"),
+            _make_event("e1", "A", "B"),
+            _make_event("e2", "A", "B"),
+            _make_event("e3", "A", "B"),
+            _make_event("e4", "A", "B"),
+            _make_event("e5", "A", "B"),
+        ]
+    }
+
+    token_ids = tokenizer.tokenize(session)
+
+    assert token_ids == [
+        tokenizer.cls_token,
+        12,
+        13,
+        14,
+        15,
+        tokenizer.sep_token,
+    ]
+
+
+def test_decode_inverts_known_ids(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+
+    ids = [5, 6, 123456]
+    decoded = tokenizer.decode(ids)
+
+    assert decoded[0] == "4624_Kerberos_Network"
+    assert decoded[1] == "4768_NTLM_Interactive"
+    assert decoded[2] == "[UNK]"
+
+
+def test_attention_mask_marks_padding(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    session = {
+        "events": [_make_event("4624", "Kerberos", "Network")],
+    }
+
+    token_ids, attention_mask = tokenizer.tokenize_with_attention_mask(session)
+
+    assert token_ids == [0, 5, 1, 3, 3, 3, 3, 3]
+    assert attention_mask == [1, 1, 1, 0, 0, 0, 0, 0]
+
+
+def test_invalid_vocab_missing_special_token(tmp_path: Path) -> None:
+    invalid_vocab = {
+        "[CLS]": 0,
+        "[SEP]": 1,
+        "[MASK]": 2,
+        "[PAD]": 3,
+    }
+    path = tmp_path / "invalid_vocab.json"
+    path.write_text(json.dumps(invalid_vocab), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        LogTokenizer(vocab_path=path)
