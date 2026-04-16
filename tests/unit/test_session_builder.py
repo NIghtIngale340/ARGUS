@@ -1,5 +1,8 @@
+from collections import Counter
+
 import pytest
 
+import src.parsing.session_builder as session_builder_module
 from src.parsing.session_builder import SessionBuilder
 
 
@@ -125,3 +128,46 @@ def test_sensitive_event_fields_are_removed_and_event_id_is_backfilled() -> None
         "template_params",
     ):
         assert key not in event
+
+
+def test_overlapping_windows_do_not_resanitize_events() -> None:
+    class CountingSessionBuilder(SessionBuilder):
+        def __init__(self) -> None:
+            super().__init__(window_mins=30, stride_mins=15, min_events=3, timestamp_unit="seconds")
+            self.sanitized_event_ids: list[str] = []
+
+        def _sanitize_event(self, event):  # type: ignore[override]
+            self.sanitized_event_ids.append(str(event["event_id"]))
+            return super()._sanitize_event(event)
+
+    builder = CountingSessionBuilder()
+    events = [
+        {"user": "alice", "host": "pc1", "time": 0, "event_id": "E0"},
+        {"user": "alice", "host": "pc1", "time": 600, "event_id": "E1"},
+        {"user": "alice", "host": "pc1", "time": 1200, "event_id": "E2"},
+        {"user": "alice", "host": "pc1", "time": 1500, "event_id": "E3"},
+        {"user": "alice", "host": "pc1", "time": 1800, "event_id": "E4"},
+        {"user": "alice", "host": "pc1", "time": 2100, "event_id": "E5"},
+        {"user": "alice", "host": "pc1", "time": 2400, "event_id": "E6"},
+    ]
+
+    sessions = builder.build_sessions(events)
+
+    assert len(sessions) >= 2
+    assert sum(len(session.events) for session in sessions) > len(events)
+    assert Counter(builder.sanitized_event_ids) == Counter(event["event_id"] for event in events)
+
+
+def test_hash_id_cache_preserves_outputs_for_normal_and_blank_ids() -> None:
+    session_builder_module._hash_normalized_id.cache_clear()
+    builder = SessionBuilder(window_mins=30, stride_mins=15, min_events=1, timestamp_unit="seconds")
+
+    alice_hash = builder._hash_id("alice")
+
+    assert builder._hash_id("alice") == alice_hash
+    assert builder._hash_id(None) == "UNKNOWN"
+    assert builder._hash_id("   ") == "UNKNOWN"
+
+    cache_info = session_builder_module._hash_normalized_id.cache_info()
+    assert cache_info.misses == 1
+    assert cache_info.hits >= 1

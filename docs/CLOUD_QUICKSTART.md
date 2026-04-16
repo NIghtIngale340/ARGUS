@@ -21,8 +21,10 @@ Use these variables in both platforms:
 - `START_DAY=1`, `END_DAY=58`, `RESUME=true`.
 - `DAY_BATCH_SIZE`: contiguous days per build command (larger is faster, smaller is safer).
 - `BUCKET_COUNT`: memory-safety control for sessionization (`256` recommended).
+- `REFRESH_GIT_CLONE=true`: default notebook behavior for Git-based runs so stale cloud repo copies are replaced before sessionization.
 
 `build_sessions.py` now uses disk buckets per day to lower peak RAM usage. This is important for Kaggle/Colab full-data runs.
+Both resumable notebooks validate the resolved `scripts/build_sessions.py --help` output before smoke or batch runs and fail fast if `--bucket-count` is missing.
 
 Outputs are created under `OUTPUT_ROOT/data`:
 
@@ -41,6 +43,7 @@ Outputs are created under `OUTPUT_ROOT/data`:
 
 `kagglehub.dataset_download(...)` downloads the Kaggle dataset into Colab local storage and returns the downloaded folder path.  
 The notebook then searches that folder for `auth.txt` and sets `AUTH_PATH` automatically.
+When `USE_GIT_CLONE=True`, the notebook refreshes `/content/ARGUS` by default before cloning so a stale repo copy does not bypass the newer CLI contract.
 
 If running manually, use this command pattern per batch:
 
@@ -62,6 +65,8 @@ python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.
 - Default repo clone source: `https://github.com/NIghtIngale340/ARGUS`
 - Dataset path behavior: auto-detect first `auth.txt` under `/kaggle/input/**`
 - Notebook to run: `notebooks/kaggle_58day_resumable.ipynb`
+
+When `USE_GIT_CLONE=True`, the notebook refreshes `/kaggle/working/ARGUS` by default before cloning so resumable outputs remain under `OUTPUT_ROOT` while the repo copy can be safely replaced.
 
 After each successful day batch, save a Kaggle version:
 

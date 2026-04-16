@@ -1,11 +1,12 @@
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
 import shutil
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, TextIO
+from typing import Any, BinaryIO, Dict, List, Optional
 
 import pandas as pd
 import pyarrow as pa
@@ -16,6 +17,11 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.parsing.drain3_parser import LogParser
 from src.parsing.session_builder import SessionBuilder
+
+try:
+    import orjson as _orjson
+except ImportError:
+    _orjson = None
 
 LANL_AUTH_COLUMNS_9 = (
     "time",
@@ -74,6 +80,12 @@ def parse_args() -> argparse.Namespace:
         default=256,
         help="Disk bucket count used for memory-safe day processing (higher reduces peak RAM).",
     )
+    arg_parser.add_argument(
+        "--bucket-workers",
+        type=int,
+        default=1,
+        help="Number of worker processes used while converting day buckets into session parquet shards.",
+    )
     return arg_parser.parse_args()
 
 
@@ -92,6 +104,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-tokens must be > 0")
     if args.bucket_count <= 0:
         raise ValueError("--bucket-count must be > 0")
+    if args.bucket_workers <= 0:
+        raise ValueError("--bucket-workers must be > 0")
 
 
 def get_day_index(timestamp_seconds: int) -> int:
@@ -166,7 +180,19 @@ def _bucket_index(event: Dict[str, object], bucket_count: int) -> int:
     return int.from_bytes(digest, byteorder="big") % bucket_count
 
 
-def _close_bucket_handles(handles: Dict[int, TextIO]) -> None:
+def _json_dumps_bytes(payload: Dict[str, object]) -> bytes:
+    if _orjson is not None:
+        return _orjson.dumps(payload)
+    return json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+
+
+def _json_loads(raw: bytes) -> Dict[str, object]:
+    if _orjson is not None:
+        return _orjson.loads(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def _close_bucket_handles(handles: Dict[int, BinaryIO]) -> None:
     for handle in handles.values():
         handle.close()
     handles.clear()
@@ -174,7 +200,7 @@ def _close_bucket_handles(handles: Dict[int, TextIO]) -> None:
 
 def _write_event_to_bucket(
     day_dir: Path,
-    handles: Dict[int, TextIO],
+    handles: Dict[int, BinaryIO],
     event: Dict[str, object],
     bucket_count: int,
 ) -> None:
@@ -182,10 +208,43 @@ def _write_event_to_bucket(
     handle = handles.get(idx)
     if handle is None:
         bucket_path = day_dir / f"bucket_{idx:04d}.jsonl"
-        handle = bucket_path.open("a", encoding="utf-8")
+        handle = bucket_path.open("ab")
         handles[idx] = handle
-    handle.write(json.dumps(event, separators=(",", ":"), ensure_ascii=True))
-    handle.write("\n")
+    handle.write(_json_dumps_bytes(event))
+    handle.write(b"\n")
+
+
+def _builder_config_from_builder(builder: SessionBuilder) -> Dict[str, Any]:
+    return {
+        "window_mins": builder.window_mins,
+        "stride_mins": builder.stride_mins,
+        "min_events": builder.min_events,
+        "max_tokens": builder.max_tokens,
+        "timestamp_unit": builder.timestamp_unit,
+    }
+
+
+def _load_bucket_events(bucket_file: Path) -> List[Dict[str, object]]:
+    events: List[Dict[str, object]] = []
+    with bucket_file.open("rb") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            events.append(_json_loads(line))
+    return events
+
+
+def _process_bucket_file(
+    bucket_file: str,
+    builder_config: Dict[str, Any],
+) -> tuple[int, List[Dict[str, object]]]:
+    events = _load_bucket_events(Path(bucket_file))
+    if not events:
+        return 0, []
+
+    builder = SessionBuilder(**builder_config)
+    sessions = builder.build_sessions(events)
+    return len(events), [asdict(session) for session in sessions]
 
 
 def _write_day_sessions_from_buckets(
@@ -193,6 +252,7 @@ def _write_day_sessions_from_buckets(
     day_dir: Path,
     out_dir: Path,
     builder: SessionBuilder,
+    bucket_workers: int = 1,
 ) -> tuple[int, int]:
     output_file = out_dir / f"day_{day:02d}.parquet"
     if output_file.exists():
@@ -203,29 +263,42 @@ def _write_day_sessions_from_buckets(
     total_day_sessions = 0
 
     bucket_files = sorted(day_dir.glob("bucket_*.jsonl"))
-    for bucket_file in tqdm(bucket_files, desc=f"Day {day:02d} buckets", leave=False):
-        events: List[Dict[str, object]] = []
-        with bucket_file.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if not line.strip():
+    builder_config = _builder_config_from_builder(builder)
+
+    if bucket_workers > 1 and len(bucket_files) > 1:
+        with ProcessPoolExecutor(max_workers=bucket_workers) as executor:
+            futures = [
+                executor.submit(_process_bucket_file, str(bucket_file), builder_config)
+                for bucket_file in bucket_files
+            ]
+            iterator = tqdm(futures, desc=f"Day {day:02d} buckets", leave=False)
+            for future in iterator:
+                bucket_event_count, session_dicts = future.result()
+                total_day_events += bucket_event_count
+                if not session_dicts:
                     continue
-                events.append(json.loads(line))
 
-        if not events:
-            continue
+                total_day_sessions += len(session_dicts)
+                dataframe = pd.DataFrame(session_dicts)
+                table = pa.Table.from_pandas(dataframe, preserve_index=False)
 
-        total_day_events += len(events)
-        sessions = builder.build_sessions(events)
-        if not sessions:
-            continue
+                if writer is None:
+                    writer = pq.ParquetWriter(str(output_file), table.schema, compression="snappy")
+                writer.write_table(table)
+    else:
+        for bucket_file in tqdm(bucket_files, desc=f"Day {day:02d} buckets", leave=False):
+            bucket_event_count, session_dicts = _process_bucket_file(str(bucket_file), builder_config)
+            total_day_events += bucket_event_count
+            if not session_dicts:
+                continue
 
-        total_day_sessions += len(sessions)
-        dataframe = pd.DataFrame([asdict(session) for session in sessions])
-        table = pa.Table.from_pandas(dataframe, preserve_index=False)
+            total_day_sessions += len(session_dicts)
+            dataframe = pd.DataFrame(session_dicts)
+            table = pa.Table.from_pandas(dataframe, preserve_index=False)
 
-        if writer is None:
-            writer = pq.ParquetWriter(str(output_file), table.schema, compression="snappy")
-        writer.write_table(table)
+            if writer is None:
+                writer = pq.ParquetWriter(str(output_file), table.schema, compression="snappy")
+            writer.write_table(table)
 
     if writer is not None:
         writer.close()
@@ -275,7 +348,7 @@ def main() -> None:
 
     current_day: Optional[int] = None
     current_day_dir: Optional[Path] = None
-    bucket_handles: Dict[int, TextIO] = {}
+    bucket_handles: Dict[int, BinaryIO] = {}
 
     def flush_current_day() -> None:
         nonlocal current_day, current_day_dir
@@ -288,6 +361,7 @@ def main() -> None:
             day_dir=current_day_dir,
             out_dir=out_dir,
             builder=builder,
+            bucket_workers=args.bucket_workers,
         )
         stats.processed_days += 1
         stats.written_sessions += day_sessions

@@ -1,6 +1,7 @@
 import hashlib
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Tuple
 
 Event = Dict[str, Any]
@@ -18,6 +19,12 @@ SENSITIVE_EVENT_FIELDS = {
     "dst_computer",
     "template_params",
 }
+
+
+@lru_cache(maxsize=4096)
+def _hash_normalized_id(normalized: str) -> str:
+    hash_obj = hashlib.sha256(normalized.encode("utf-8"))
+    return hash_obj.hexdigest()[:8]
 
 
 @dataclass
@@ -66,8 +73,7 @@ class SessionBuilder:
         normalized = str(raw_id).strip() if raw_id is not None else ""
         if not normalized:
             return "UNKNOWN"
-        hash_obj = hashlib.sha256(normalized.encode("utf-8"))
-        return hash_obj.hexdigest()[:8]
+        return _hash_normalized_id(normalized)
 
     def _extract_timestamp(self, event: Event) -> Optional[int]:
         for key in ("time", "timestamp"):
@@ -141,7 +147,6 @@ class SessionBuilder:
                 window_events = events[start_idx:end_idx]
                 if event_count > self.max_tokens:
                     window_events = window_events[-self.max_tokens :]
-                window_events = [self._sanitize_event(event) for event in window_events]
 
                 sessions.append(
                     Session(
@@ -168,7 +173,8 @@ class SessionBuilder:
             normalized_event["time"] = event_time
 
             user_id, host_id = self._extract_group_key(normalized_event)
-            grouped_events[(user_id, host_id)].append(normalized_event)
+            sanitized_event = self._sanitize_event(normalized_event)
+            grouped_events[(user_id, host_id)].append(sanitized_event)
 
         sessions: List[Session] = []
         for (user_id, host_id), user_host_events in grouped_events.items():
