@@ -1,7 +1,7 @@
 import argparse
 import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 import sys
 
 import pandas as pd
@@ -9,7 +9,7 @@ import pandas as pd
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from src.parsing.log_tokenizer import LogTokenizer
-from src.parsing.vocab_builder import VocabBuilder
+from src.parsing.vocab_builder import VocabBuilder, build_event_token
 
 SPLIT_DAY_RANGES = {
     "train": (1, 40),
@@ -40,7 +40,16 @@ def parse_args() -> argparse.Namespace:
         "--vocab-out",
         type=str,
         default="data/vocab.json",
-        help="Output path for vocabulary JSON",
+        help="Output path for vocabulary JSON when building a new vocabulary",
+    )
+    parser.add_argument(
+        "--vocab-in",
+        type=str,
+        default=None,
+        help=(
+            "Existing vocabulary JSON to reuse for tokenization. "
+            "Use this for val/test so all splits share the train vocabulary."
+        ),
     )
     parser.add_argument(
         "--tokenized-out",
@@ -63,11 +72,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _coerce_events(events: Any) -> List[Dict[str, Any]]:
+def _increment_stat(stats: Optional[Dict[str, int]], key: str, amount: int = 1) -> None:
+    if stats is not None:
+        stats[key] = stats.get(key, 0) + amount
+
+
+def _coerce_events(events: Any, stats: Optional[Dict[str, int]] = None) -> List[Dict[str, Any]]:
     if events is None:
         return []
 
     if isinstance(events, (str, bytes)):
+        _increment_stat(stats, "invalid_event_containers")
         return []
 
     if hasattr(events, "tolist") and not isinstance(events, list):
@@ -77,12 +92,15 @@ def _coerce_events(events: Any) -> List[Dict[str, Any]]:
         events = list(events)
 
     if not isinstance(events, list):
+        _increment_stat(stats, "invalid_event_containers")
         return []
 
     normalized: List[Dict[str, Any]] = []
     for event in events:
         if isinstance(event, Mapping):
             normalized.append(dict(event))
+        else:
+            _increment_stat(stats, "dropped_events")
     return normalized
 
 
@@ -114,6 +132,42 @@ def _validate_vocab_size(vocab: Dict[str, int], min_expected: int = 6) -> None:
         )
 
 
+def _warn_if_event_token_space_looks_suspicious(
+    sessions: Iterable[Mapping[str, Any]],
+    vocab: Mapping[str, int],
+    min_distinct_tokens: int = 50,
+) -> None:
+    total_events = 0
+    missing_event_ids = 0
+    distinct_observed_tokens = set()
+
+    for session in sessions:
+        for event in session.get("events", []):
+            if not isinstance(event, Mapping):
+                continue
+            total_events += 1
+            event_id = event.get("event_id")
+            if event_id is None or str(event_id).strip() in {"", "NA", "UNK"}:
+                missing_event_ids += 1
+            distinct_observed_tokens.add(build_event_token(event))
+
+    learned_token_count = max(0, len(vocab) - len(LogTokenizer.REQUIRED_SPECIAL_TOKENS))
+    if total_events and missing_event_ids:
+        print(
+            "Warning: events with missing/placeholder event_id detected "
+            f"({missing_event_ids:,}/{total_events:,}). "
+            "If this is high, check Drain3 enrichment before tokenization."
+        )
+
+    if total_events >= min_distinct_tokens and learned_token_count < min_distinct_tokens:
+        print(
+            "Warning: learned vocabulary is small for this split "
+            f"({learned_token_count:,} learned tokens; "
+            f"{len(distinct_observed_tokens):,} distinct observed event tokens). "
+            "If unexpected, check event_id/template_id generation and --min-freq."
+        )
+
+
 def _extract_day_from_shard_name(parquet_path: Path) -> int:
     match = re.search(r"day_(\d+)\.parquet$", parquet_path.name)
     if not match:
@@ -139,13 +193,25 @@ def _filter_paths_for_split(parquet_paths: Iterable[Path], split: str) -> List[P
 
 def load_sessions(parquet_paths: Iterable[Path]) -> List[Dict[str, Any]]:
     sessions: List[Dict[str, Any]] = []
+    coercion_stats: Dict[str, int] = {}
 
     for parquet_path in parquet_paths:
         dataframe = pd.read_parquet(parquet_path)
         for row in dataframe.to_dict(orient="records"):
             normalized_row = dict(row)
-            normalized_row["events"] = _coerce_events(normalized_row.get("events", []))
+            normalized_row["events"] = _coerce_events(
+                normalized_row.get("events", []),
+                stats=coercion_stats,
+            )
             sessions.append(normalized_row)
+
+    invalid_containers = coercion_stats.get("invalid_event_containers", 0)
+    dropped_events = coercion_stats.get("dropped_events", 0)
+    if invalid_containers or dropped_events:
+        print(
+            "Warning: dropped malformed event data while loading sessions "
+            f"(invalid event containers={invalid_containers:,}, dropped events={dropped_events:,})."
+        )
 
     return sessions
 
@@ -180,17 +246,30 @@ def main() -> None:
     _summarize_sessions(sessions)
     _ensure_sessions_have_events(sessions)
 
-    vocab_builder = VocabBuilder(min_freq=args.min_freq)
-    vocab = vocab_builder.build_vocab(sessions=sessions, save_path=args.vocab_out)
-    _validate_vocab_size(vocab)
+    if args.vocab_in:
+        vocab_path = Path(args.vocab_in)
+        tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=args.max_len)
+        vocab = tokenizer.vocab
+        print(f"Loaded existing vocabulary from: {vocab_path}")
+    else:
+        vocab_builder = VocabBuilder(min_freq=args.min_freq)
+        vocab = vocab_builder.build_vocab(sessions=sessions, save_path=args.vocab_out)
+        vocab_path = Path(args.vocab_out)
+        tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=args.max_len)
+        print(f"Built vocabulary from split '{args.split}' sessions.")
 
-    tokenizer = LogTokenizer(vocab_path=args.vocab_out, max_len=args.max_len)
-    tokenized_path = tokenizer.save_tokenized_sessions_pt(sessions=sessions, output_path=args.tokenized_out)
+    _validate_vocab_size(vocab)
+    _warn_if_event_token_space_looks_suspicious(sessions, vocab)
+    save_stats = tokenizer.save_tokenized_sessions_pt_with_stats(
+        sessions=sessions,
+        output_path=args.tokenized_out,
+    )
 
     print("\nArtifacts generated successfully:")
     print(f"- Vocabulary size: {len(vocab):,}")
-    print(f"- Vocab path: {Path(args.vocab_out)}")
-    print(f"- Tokenized path: {tokenized_path}")
+    print(f"- Vocab path: {vocab_path}")
+    print(f"- Tokenized path: {save_stats.path}")
+    print(f"- Unknown events: {save_stats.unknown_events:,}/{save_stats.total_events:,}")
 
 
 if __name__ == "__main__":

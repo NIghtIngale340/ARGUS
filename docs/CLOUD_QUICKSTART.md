@@ -55,8 +55,8 @@ Then tokenization by split (run from `OUTPUT_ROOT` so `data/...` paths resolve c
 
 ```bash
 python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split train --vocab-out data/vocab.json --tokenized-out data/tokenized/sessions_train.pt
-python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split val --vocab-out data/vocab_val.json --tokenized-out data/tokenized/sessions_val.pt
-python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split test --vocab-out data/vocab_test.json --tokenized-out data/tokenized/sessions_test.pt
+python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split val --vocab-in data/vocab.json --tokenized-out data/tokenized/sessions_val.pt
+python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split test --vocab-in data/vocab.json --tokenized-out data/tokenized/sessions_test.pt
 ```
 
 ## Option 2: Kaggle (`/kaggle/working` persistence)

@@ -1,9 +1,16 @@
 import importlib
 import json
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Mapping, Sequence, Tuple, Union, overload
 
-from src.parsing.vocab_builder import build_event_token
+try:
+    from .vocab_builder import build_event_token
+except ImportError:
+    try:
+        from src.parsing.vocab_builder import build_event_token
+    except ImportError:
+        from vocab_builder import build_event_token
 
 try:
     torch = importlib.import_module("torch")
@@ -11,14 +18,29 @@ except ModuleNotFoundError:
     torch = None
 
 
+@dataclass(frozen=True)
+class TokenizedSaveStats:
+    path: Path
+    unknown_events: int
+    total_events: int
+
+
 class LogTokenizer:
     REQUIRED_SPECIAL_TOKENS = ("[CLS]", "[SEP]", "[MASK]", "[PAD]", "[UNK]")
 
-    def __init__(self, vocab_path: Union[str, Path], max_len: int = 512):
+    def __init__(
+        self,
+        vocab_path: Union[str, Path],
+        max_len: int = 512,
+        truncation_side: Literal["left", "right"] = "left",
+    ):
         if max_len < 3:
             raise ValueError("max_len must be >= 3 to fit [CLS], at least one token, and [SEP]")
+        if truncation_side not in {"left", "right"}:
+            raise ValueError("truncation_side must be either 'left' or 'right'")
 
         self.max_len = max_len
+        self.truncation_side = truncation_side
         self.vocab_path = Path(vocab_path)
         self.vocab = self._load_vocab(self.vocab_path)
         self.id_to_token = self._build_reverse_vocab(self.vocab)
@@ -62,31 +84,45 @@ class LogTokenizer:
             reverse_vocab[token_id] = token
         return reverse_vocab
 
+    def _coerce_session(self, session: Any) -> Mapping[str, Any]:
+        if isinstance(session, Mapping):
+            return session
+        if is_dataclass(session) and not isinstance(session, type):
+            return asdict(session)
+        raise TypeError("session must be a mapping or dataclass instance")
+
     def encode_event(self, event: Mapping[str, Any]) -> int:
         token_str = build_event_token(event)
         return self.vocab.get(token_str, self.unk_token)
 
+    def _encode_events(self, events: Iterable[Mapping[str, Any]]) -> List[int]:
+        return [self.encode_event(event) for event in events]
+
     def _trim_event_tokens(self, event_token_ids: List[int]) -> List[int]:
         max_events = self.max_len - 2
         if len(event_token_ids) > max_events:
-            return event_token_ids[-max_events:]
+            if self.truncation_side == "left":
+                return event_token_ids[-max_events:]
+            return event_token_ids[:max_events]
         return event_token_ids
 
-    def tokenize(self, session: Mapping[str, Any]) -> List[int]:
-        events = session.get("events", [])
-        event_token_ids = [self.encode_event(event) for event in events]
+    def _build_sequence(self, event_token_ids: List[int]) -> List[int]:
         event_token_ids = self._trim_event_tokens(event_token_ids)
-
         sequence = [self.cls_token] + event_token_ids + [self.sep_token]
         padding_needed = self.max_len - len(sequence)
         if padding_needed > 0:
             sequence.extend([self.pad_token] * padding_needed)
         return sequence
 
+    def tokenize(self, session: Any) -> List[int]:
+        session_data = self._coerce_session(session)
+        events = session_data.get("events", [])
+        return self._build_sequence(self._encode_events(events))
+
     def build_attention_mask(self, token_ids: Sequence[int]) -> List[int]:
         return [0 if token_id == self.pad_token else 1 for token_id in token_ids]
 
-    def tokenize_with_attention_mask(self, session: Mapping[str, Any]) -> Tuple[List[int], List[int]]:
+    def tokenize_with_attention_mask(self, session: Any) -> Tuple[List[int], List[int]]:
         token_ids = self.tokenize(session)
         attention_mask = self.build_attention_mask(token_ids)
         return token_ids, attention_mask
@@ -94,11 +130,30 @@ class LogTokenizer:
     def decode(self, ids: Sequence[int]) -> List[str]:
         return [self.id_to_token.get(int(idx), "[UNK]") for idx in ids]
 
+    @overload
     def save_tokenized_sessions_pt(
         self,
-        sessions: Iterable[Mapping[str, Any]],
+        sessions: Iterable[Any],
         output_path: Union[str, Path],
+        return_stats: Literal[False] = False,
     ) -> Path:
+        ...
+
+    @overload
+    def save_tokenized_sessions_pt(
+        self,
+        sessions: Iterable[Any],
+        output_path: Union[str, Path],
+        return_stats: Literal[True],
+    ) -> Tuple[Path, int, int]:
+        ...
+
+    def save_tokenized_sessions_pt(
+        self,
+        sessions: Iterable[Any],
+        output_path: Union[str, Path],
+        return_stats: bool = False,
+    ) -> Union[Path, Tuple[Path, int, int]]:
         if torch is None:
             raise RuntimeError("PyTorch is not installed. Install torch to save .pt artifacts.")
 
@@ -106,15 +161,40 @@ class LogTokenizer:
         output.parent.mkdir(parents=True, exist_ok=True)
 
         serialized = []
+        unknown_events = 0
+        total_events = 0
         for idx, session in enumerate(sessions):
-            input_ids, attention_mask = self.tokenize_with_attention_mask(session)
+            session_data = self._coerce_session(session)
+            event_token_ids = self._encode_events(session_data.get("events", []))
+            total_events += len(event_token_ids)
+            unknown_events += sum(1 for token_id in event_token_ids if token_id == self.unk_token)
+            input_ids = self._build_sequence(event_token_ids)
+            attention_mask = self.build_attention_mask(input_ids)
             serialized.append(
                 {
-                    "session_id": session.get("session_id", idx),
+                    "session_id": session_data.get("session_id", idx),
                     "input_ids": torch.tensor(input_ids, dtype=torch.long),
                     "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
                 }
             )
 
         torch.save(serialized, output)
+        if return_stats:
+            return output, unknown_events, total_events
         return output
+
+    def save_tokenized_sessions_pt_with_stats(
+        self,
+        sessions: Iterable[Any],
+        output_path: Union[str, Path],
+    ) -> TokenizedSaveStats:
+        path, unknown_events, total_events = self.save_tokenized_sessions_pt(
+            sessions=sessions,
+            output_path=output_path,
+            return_stats=True,
+        )
+        return TokenizedSaveStats(
+            path=path,
+            unknown_events=unknown_events,
+            total_events=total_events,
+        )

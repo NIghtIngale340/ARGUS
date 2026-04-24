@@ -1,9 +1,12 @@
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-from src.parsing.log_tokenizer import LogTokenizer
+from src.parsing.log_tokenizer import LogTokenizer, TokenizedSaveStats
+from src.parsing.session_builder import Session
 
 
 def _make_event(event_id: str, auth_type: str = "Kerberos", logon_type: str = "Network"):
@@ -87,6 +90,115 @@ def test_tokenize_truncates_to_last_events(vocab_path: Path) -> None:
         15,
         tokenizer.sep_token,
     ]
+
+
+def test_tokenize_can_accept_session_dataclass(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    session = Session(
+        user_id="user-hash",
+        host_id="host-hash",
+        start_ts=0,
+        end_ts=60,
+        events=[_make_event("4624", "Kerberos", "Network")],
+    )
+
+    token_ids = tokenizer.tokenize(session)
+
+    assert token_ids == [0, 5, 1, 3, 3, 3, 3, 3]
+
+
+def test_save_tokenized_sessions_pt_can_accept_session_dataclass(
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    session = Session(
+        user_id="user-hash",
+        host_id="host-hash",
+        start_ts=0,
+        end_ts=60,
+        events=[_make_event("4624", "Kerberos", "Network")],
+    )
+
+    output_path, unknown_events, total_events = tokenizer.save_tokenized_sessions_pt(
+        [session],
+        tmp_path / "sessions.pt",
+        return_stats=True,
+    )
+
+    try:
+        artifact = torch.load(output_path, weights_only=False)
+    except TypeError:
+        artifact = torch.load(output_path)
+    assert unknown_events == 0
+    assert total_events == 1
+    assert artifact[0]["session_id"] == 0
+    assert artifact[0]["input_ids"].tolist() == [0, 5, 1, 3, 3, 3, 3, 3]
+
+
+def test_save_tokenized_sessions_pt_with_stats_returns_named_result(
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    session = {"events": [_make_event("9999", "Kerberos", "Network")]}
+
+    result = tokenizer.save_tokenized_sessions_pt_with_stats([session], tmp_path / "sessions.pt")
+
+    assert isinstance(result, TokenizedSaveStats)
+    assert result.path == tmp_path / "sessions.pt"
+    assert result.unknown_events == 1
+    assert result.total_events == 1
+
+
+def test_tokenize_can_keep_first_events_when_truncating_right(vocab_path: Path) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=6, truncation_side="right")
+    session = {
+        "events": [
+            _make_event("e0", "A", "B"),
+            _make_event("e1", "A", "B"),
+            _make_event("e2", "A", "B"),
+            _make_event("e3", "A", "B"),
+            _make_event("e4", "A", "B"),
+            _make_event("e5", "A", "B"),
+        ]
+    }
+
+    token_ids = tokenizer.tokenize(session)
+
+    assert token_ids == [
+        tokenizer.cls_token,
+        10,
+        11,
+        12,
+        13,
+        tokenizer.sep_token,
+    ]
+
+
+def test_invalid_truncation_side_raises(vocab_path: Path) -> None:
+    with pytest.raises(ValueError, match="truncation_side"):
+        LogTokenizer(vocab_path=vocab_path, truncation_side="middle")  # type: ignore[arg-type]
+
+
+def test_log_tokenizer_can_be_imported_as_top_level_module() -> None:
+    parsing_dir = Path(__file__).resolve().parents[2] / "src" / "parsing"
+    script = (
+        "import sys; "
+        f"sys.path.insert(0, {str(parsing_dir)!r}); "
+        "import log_tokenizer; "
+        "print(log_tokenizer.LogTokenizer.__name__)"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.stdout.strip() == "LogTokenizer"
 
 
 def test_decode_inverts_known_ids(vocab_path: Path) -> None:

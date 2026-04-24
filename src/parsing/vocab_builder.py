@@ -1,5 +1,6 @@
 import json
 from collections import Counter
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Union
 
@@ -27,17 +28,36 @@ class VocabBuilder:
         self.min_freq = min_freq
         self.special_tokens = list(special_tokens)
 
-    def _iter_session_tokens(self, sessions: Iterable[Mapping[str, Any]]) -> Iterable[str]:
+    def _coerce_session(self, session: Any) -> Optional[Mapping[str, Any]]:
+        if isinstance(session, Mapping):
+            return session
+        if is_dataclass(session) and not isinstance(session, type):
+            return asdict(session)
+        return None
+
+    def _iter_session_tokens(self, sessions: Iterable[Any]) -> Iterable[str]:
         for session in sessions:
-            for event in session.get("events", []):
+            session_data = self._coerce_session(session)
+            if session_data is None:
+                continue
+
+            events = session_data.get("events", [])
+            if isinstance(events, tuple):
+                events = list(events)
+            if not isinstance(events, list):
+                continue
+
+            for event in events:
+                if not isinstance(event, Mapping):
+                    continue
                 yield build_event_token(event)
 
-    def _build_counts(self, sessions: Iterable[Mapping[str, Any]]) -> Counter:
+    def _build_counts(self, sessions: Iterable[Any]) -> Counter:
         return Counter(self._iter_session_tokens(sessions))
 
     def build_vocab(
         self,
-        sessions: Iterable[Mapping[str, Any]],
+        sessions: Iterable[Any],
         save_path: Optional[Union[str, Path]] = None,
     ) -> Dict[str, int]:
         token_counts = self._build_counts(sessions)

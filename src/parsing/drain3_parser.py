@@ -62,9 +62,7 @@ class LogParser:
             state_bytes = zlib.decompress(base64.b64decode(state_bytes))
 
         loaded_drain = jsonpickle.loads(state_bytes, keys=True)
-        self.miner.drain.id_to_cluster = loaded_drain.id_to_cluster
-        self.miner.drain.clusters_counter = loaded_drain.clusters_counter
-        self.miner.drain.root_node = loaded_drain.root_node
+        self.miner.drain.__dict__.update(loaded_drain.__dict__)
 
         return True
 
