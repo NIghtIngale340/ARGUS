@@ -317,16 +317,10 @@ def main() -> None:
 
     parquet_paths = _filter_paths_for_split(all_parquet_paths, split=args.split)
     if not parquet_paths:
-        raise RuntimeError(
-            f"No parquet shards matched split '{args.split}' ({SPLIT_DAY_RANGES[args.split][0]}-"
-            f"{SPLIT_DAY_RANGES[args.split][1]})."
-        )
+        raise RuntimeError(f"No parquet shards matched split '{args.split}'.")
 
     split_start, split_end = SPLIT_DAY_RANGES[args.split]
-    print(
-        f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' "
-        f"(days {split_start}-{split_end})."
-    )
+    print(f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' (days {split_start}-{split_end}).")
 
     if args.vocab_in:
         vocab_path = Path(args.vocab_in)
@@ -359,6 +353,7 @@ def main() -> None:
     print(f"- Vocab path: {vocab_path}")
     print(f"- Tokenized path: {save_stats.path}")
     print(f"- Unknown events: {save_stats.unknown_events:,}/{save_stats.total_events:,}")
+
 
 
 if __name__ == "__main__":
