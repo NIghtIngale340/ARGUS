@@ -1,5 +1,6 @@
 import importlib
 import json
+import shutil
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Mapping, Sequence, Tuple, Union, overload
@@ -23,6 +24,10 @@ class TokenizedSaveStats:
     path: Path
     unknown_events: int
     total_events: int
+
+
+TOKENIZED_CHUNK_MANIFEST_FORMAT = "tokenized_session_chunk_manifest_v1"
+TOKENIZED_CHUNK_FORMAT = "tokenized_session_chunk_v1"
 
 
 class LogTokenizer:
@@ -195,6 +200,99 @@ class LogTokenizer:
         )
         return TokenizedSaveStats(
             path=path,
+            unknown_events=unknown_events,
+            total_events=total_events,
+        )
+
+    def save_tokenized_sessions_pt_chunked_with_stats(
+        self,
+        sessions: Iterable[Any],
+        output_path: Union[str, Path],
+        chunk_size: int = 10_000,
+    ) -> TokenizedSaveStats:
+        if torch is None:
+            raise RuntimeError("PyTorch is not installed. Install torch to save .pt artifacts.")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0")
+
+        output = Path(output_path)
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+        chunk_dir = output.parent / f"{output.stem}_chunks"
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir)
+
+        pending_session_ids: List[Any] = []
+        pending_input_ids: List[List[int]] = []
+        pending_attention_masks: List[List[int]] = []
+        chunk_paths: List[str] = []
+        unknown_events = 0
+        total_events = 0
+        session_count = 0
+
+        def flush_chunk(chunk_index: int) -> None:
+            chunk_dir.mkdir(parents=True, exist_ok=True)
+            chunk_path = chunk_dir / f"chunk_{chunk_index:05d}.pt"
+            chunk_artifact = {
+                "format": TOKENIZED_CHUNK_FORMAT,
+                "session_ids": list(pending_session_ids),
+                "input_ids": torch.tensor(pending_input_ids, dtype=torch.long),
+                "attention_mask": torch.tensor(pending_attention_masks, dtype=torch.long),
+            }
+            torch.save(chunk_artifact, chunk_path)
+            chunk_paths.append(str(chunk_path.relative_to(output.parent)))
+            pending_session_ids.clear()
+            pending_input_ids.clear()
+            pending_attention_masks.clear()
+
+        for idx, session in enumerate(sessions):
+            session_data = self._coerce_session(session)
+            event_token_ids = self._encode_events(session_data.get("events", []))
+            total_events += len(event_token_ids)
+            unknown_events += sum(1 for token_id in event_token_ids if token_id == self.unk_token)
+            session_count += 1
+            input_ids = self._build_sequence(event_token_ids)
+            attention_mask = self.build_attention_mask(input_ids)
+
+            pending_session_ids.append(session_data.get("session_id", idx))
+            pending_input_ids.append(input_ids)
+            pending_attention_masks.append(attention_mask)
+
+            if len(pending_session_ids) >= chunk_size:
+                flush_chunk(len(chunk_paths))
+
+        if chunk_paths:
+            if pending_session_ids:
+                flush_chunk(len(chunk_paths))
+
+            manifest = {
+                "format": TOKENIZED_CHUNK_MANIFEST_FORMAT,
+                "chunks": chunk_paths,
+                "chunk_count": len(chunk_paths),
+                "session_count": session_count,
+                "max_len": self.max_len,
+                "unknown_events": unknown_events,
+                "total_events": total_events,
+            }
+            torch.save(manifest, output)
+        else:
+            serialized = []
+            for session_id, input_ids, attention_mask in zip(
+                pending_session_ids,
+                pending_input_ids,
+                pending_attention_masks,
+            ):
+                serialized.append(
+                    {
+                        "session_id": session_id,
+                        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+                        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+                    }
+                )
+            torch.save(serialized, output)
+
+        return TokenizedSaveStats(
+            path=output,
             unknown_events=unknown_events,
             total_events=total_events,
         )

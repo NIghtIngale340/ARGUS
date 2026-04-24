@@ -174,3 +174,37 @@ def test_existing_vocab_can_be_reused_for_validation_split(tmp_path: Path) -> No
     val_input_ids = val_artifact[0]["input_ids"].tolist()
 
     assert val_input_ids[:3] == [vocab["[CLS]"], vocab["[UNK]"], vocab["[SEP]"]]
+
+
+def test_script_can_emit_chunked_tokenized_manifest(tmp_path: Path) -> None:
+    _write_session_shard(tmp_path / "data" / "sessions" / "day_01.parquet", "event-a")
+    _write_session_shard(tmp_path / "data" / "sessions" / "day_02.parquet", "event-b")
+
+    cmd = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        "--sessions-glob",
+        "data/sessions/day_*.parquet",
+        "--split",
+        "train",
+        "--vocab-out",
+        "data/vocab.json",
+        "--tokenized-out",
+        "data/tokenized/sessions_train.pt",
+        "--min-freq",
+        "1",
+        "--max-len",
+        "8",
+        "--tokenized-chunk-size",
+        "1",
+    ]
+    subprocess.run(cmd, cwd=tmp_path, check=True)
+
+    artifact = _load_torch_artifact(tmp_path / "data" / "tokenized" / "sessions_train.pt")
+    assert artifact["format"] == "tokenized_session_chunk_manifest_v1"
+    assert artifact["chunk_count"] == 2
+    assert artifact["session_count"] == 2
+
+    first_chunk = _load_torch_artifact(tmp_path / "data" / "tokenized" / artifact["chunks"][0])
+    assert first_chunk["format"] == "tokenized_session_chunk_v1"
+    assert first_chunk["input_ids"].shape[1] == 8

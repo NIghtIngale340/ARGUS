@@ -61,11 +61,19 @@ class VocabBuilder:
         save_path: Optional[Union[str, Path]] = None,
     ) -> Dict[str, int]:
         token_counts = self._build_counts(sessions)
+        return self.build_vocab_from_counts(token_counts, save_path=save_path)
+
+    def build_vocab_from_counts(
+        self,
+        token_counts: Mapping[str, int],
+        save_path: Optional[Union[str, Path]] = None,
+    ) -> Dict[str, int]:
+        counts = Counter(token_counts)
 
         vocab: Dict[str, int] = {token: idx for idx, token in enumerate(self.special_tokens)}
         next_id = len(vocab)
 
-        for token, count in sorted(token_counts.items(), key=lambda item: (-item[1], item[0])):
+        for token, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
             if count >= self.min_freq and token not in vocab:
                 vocab[token] = next_id
                 next_id += 1

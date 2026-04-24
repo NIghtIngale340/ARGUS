@@ -1,10 +1,12 @@
 import argparse
+from collections import Counter
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 import sys
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -68,6 +70,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=512,
         help="Maximum sequence length for tokenization",
+    )
+    parser.add_argument(
+        "--parquet-batch-size",
+        type=int,
+        default=2_000,
+        help="Number of session rows to decode from parquet at a time",
+    )
+    parser.add_argument(
+        "--tokenized-chunk-size",
+        type=int,
+        default=10_000,
+        help="Number of tokenized sessions to keep in memory before flushing a chunk",
     )
     return parser.parse_args()
 
@@ -191,19 +205,21 @@ def _filter_paths_for_split(parquet_paths: Iterable[Path], split: str) -> List[P
     return filtered
 
 
-def load_sessions(parquet_paths: Iterable[Path]) -> List[Dict[str, Any]]:
-    sessions: List[Dict[str, Any]] = []
+def iter_sessions(
+    parquet_paths: Iterable[Path],
+    parquet_batch_size: int = 2_000,
+) -> Iterable[Dict[str, Any]]:
     coercion_stats: Dict[str, int] = {}
-
     for parquet_path in parquet_paths:
-        dataframe = pd.read_parquet(parquet_path)
-        for row in dataframe.to_dict(orient="records"):
-            normalized_row = dict(row)
-            normalized_row["events"] = _coerce_events(
-                normalized_row.get("events", []),
-                stats=coercion_stats,
-            )
-            sessions.append(normalized_row)
+        parquet_file = pq.ParquetFile(parquet_path)
+        for batch in parquet_file.iter_batches(batch_size=parquet_batch_size):
+            for row in batch.to_pylist():
+                normalized_row = dict(row)
+                normalized_row["events"] = _coerce_events(
+                    normalized_row.get("events", []),
+                    stats=coercion_stats,
+                )
+                yield normalized_row
 
     invalid_containers = coercion_stats.get("invalid_event_containers", 0)
     dropped_events = coercion_stats.get("dropped_events", 0)
@@ -213,7 +229,74 @@ def load_sessions(parquet_paths: Iterable[Path]) -> List[Dict[str, Any]]:
             f"(invalid event containers={invalid_containers:,}, dropped events={dropped_events:,})."
         )
 
-    return sessions
+
+def _summarize_session_stream(
+    parquet_paths: Iterable[Path],
+    parquet_batch_size: int,
+) -> tuple[int, int, int]:
+    session_count = 0
+    non_empty_sessions = 0
+    total_events = 0
+
+    for session in iter_sessions(parquet_paths, parquet_batch_size=parquet_batch_size):
+        session_count += 1
+        event_count = len(session.get("events", []))
+        total_events += event_count
+        if event_count:
+            non_empty_sessions += 1
+
+    print(f"Loaded {session_count:,} sessions ({non_empty_sessions:,} non-empty).")
+    print(f"Total events across sessions: {total_events:,}")
+    return session_count, non_empty_sessions, total_events
+
+
+def _ensure_session_stream_has_events(
+    parquet_paths: Iterable[Path],
+    parquet_batch_size: int,
+) -> None:
+    for session in iter_sessions(parquet_paths, parquet_batch_size=parquet_batch_size):
+        if session.get("events"):
+            return
+    raise RuntimeError("Sessions were loaded but every session has 0 events after coercion.")
+
+
+def _analyze_event_token_space(
+    parquet_paths: Iterable[Path],
+    parquet_batch_size: int,
+) -> tuple[int, int, int]:
+    total_events = 0
+    missing_event_ids = 0
+    distinct_event_tokens = set()
+
+    for session in iter_sessions(parquet_paths, parquet_batch_size=parquet_batch_size):
+        for event in session.get("events", []):
+            if not isinstance(event, Mapping):
+                continue
+            total_events += 1
+            event_id = event.get("event_id")
+            if event_id is None or str(event_id).strip() in {"", "NA", "UNK"}:
+                missing_event_ids += 1
+            if len(distinct_event_tokens) < 50:
+                distinct_event_tokens.add(build_event_token(event))
+
+    return total_events, missing_event_ids, len(distinct_event_tokens)
+
+
+def _build_vocab_from_session_shards(
+    parquet_paths: Iterable[Path],
+    min_freq: int,
+    save_path: str,
+    parquet_batch_size: int,
+) -> Dict[str, int]:
+    vocab_builder = VocabBuilder(min_freq=min_freq)
+    token_counts: Counter[str] = Counter()
+
+    for session in iter_sessions(parquet_paths, parquet_batch_size=parquet_batch_size):
+        for event in session.get("events", []):
+            if isinstance(event, Mapping):
+                token_counts[build_event_token(event)] += 1
+
+    return vocab_builder.build_vocab_from_counts(token_counts, save_path=save_path)
 
 
 def main() -> None:
@@ -223,6 +306,10 @@ def main() -> None:
         raise ValueError("--min-freq must be > 0")
     if args.max_len < 3:
         raise ValueError("--max-len must be >= 3")
+    if args.parquet_batch_size <= 0:
+        raise ValueError("--parquet-batch-size must be > 0")
+    if args.tokenized_chunk_size <= 0:
+        raise ValueError("--tokenized-chunk-size must be > 0")
 
     all_parquet_paths = sorted(Path().glob(args.sessions_glob))
     if not all_parquet_paths:
@@ -240,11 +327,16 @@ def main() -> None:
         f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' "
         f"(days {split_start}-{split_end})."
     )
-    sessions = load_sessions(parquet_paths)
-    if not sessions:
+    session_count, _, _ = _summarize_session_stream(
+        parquet_paths,
+        parquet_batch_size=args.parquet_batch_size,
+    )
+    if session_count == 0:
         raise RuntimeError("Loaded 0 sessions from parquet files.")
-    _summarize_sessions(sessions)
-    _ensure_sessions_have_events(sessions)
+    _ensure_session_stream_has_events(
+        parquet_paths,
+        parquet_batch_size=args.parquet_batch_size,
+    )
 
     if args.vocab_in:
         vocab_path = Path(args.vocab_in)
@@ -252,17 +344,40 @@ def main() -> None:
         vocab = tokenizer.vocab
         print(f"Loaded existing vocabulary from: {vocab_path}")
     else:
-        vocab_builder = VocabBuilder(min_freq=args.min_freq)
-        vocab = vocab_builder.build_vocab(sessions=sessions, save_path=args.vocab_out)
+        vocab = _build_vocab_from_session_shards(
+            parquet_paths,
+            min_freq=args.min_freq,
+            save_path=args.vocab_out,
+            parquet_batch_size=args.parquet_batch_size,
+        )
         vocab_path = Path(args.vocab_out)
         tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=args.max_len)
         print(f"Built vocabulary from split '{args.split}' sessions.")
 
     _validate_vocab_size(vocab)
-    _warn_if_event_token_space_looks_suspicious(sessions, vocab)
-    save_stats = tokenizer.save_tokenized_sessions_pt_with_stats(
-        sessions=sessions,
+    total_events, missing_event_ids, distinct_observed_tokens = _analyze_event_token_space(
+        parquet_paths,
+        parquet_batch_size=args.parquet_batch_size,
+    )
+    if total_events and missing_event_ids:
+        print(
+            "Warning: events with missing/placeholder event_id detected "
+            f"({missing_event_ids:,}/{total_events:,}). "
+            "If this is high, check Drain3 enrichment before tokenization."
+        )
+    learned_token_count = max(0, len(vocab) - len(LogTokenizer.REQUIRED_SPECIAL_TOKENS))
+    if total_events >= 50 and learned_token_count < 50 and distinct_observed_tokens >= 50:
+        print(
+            "Warning: learned vocabulary is small for this split "
+            f"({learned_token_count:,} learned tokens; "
+            f"{distinct_observed_tokens:,} distinct observed event tokens). "
+            "If unexpected, check event_id/template_id generation and --min-freq."
+        )
+
+    save_stats = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=iter_sessions(parquet_paths, parquet_batch_size=args.parquet_batch_size),
         output_path=args.tokenized_out,
+        chunk_size=args.tokenized_chunk_size,
     )
 
     print("\nArtifacts generated successfully:")

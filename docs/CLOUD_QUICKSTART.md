@@ -33,6 +33,7 @@ Outputs are created under `OUTPUT_ROOT/data`:
 - `data/tokenized/sessions_train.pt`
 - `data/tokenized/sessions_val.pt`
 - `data/tokenized/sessions_test.pt`
+- `data/tokenized/sessions_*_chunks/chunk_XXXXX.pt` when a split is large enough to use memory-safe chunking
 
 ## Option 1: Colab (Drive-backed persistence)
 
@@ -54,10 +55,12 @@ python scripts/build_sessions.py --input "$AUTH_PATH" --start-day "$BATCH_START"
 Then tokenization by split (run from `OUTPUT_ROOT` so `data/...` paths resolve correctly):
 
 ```bash
-python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split train --vocab-out data/vocab.json --tokenized-out data/tokenized/sessions_train.pt
-python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split val --vocab-in data/vocab.json --tokenized-out data/tokenized/sessions_val.pt
-python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split test --vocab-in data/vocab.json --tokenized-out data/tokenized/sessions_test.pt
+python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split train --vocab-out data/vocab.json --tokenized-out data/tokenized/sessions_train.pt --parquet-batch-size 1000 --tokenized-chunk-size 2000
+python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split val --vocab-in data/vocab.json --tokenized-out data/tokenized/sessions_val.pt --parquet-batch-size 1000 --tokenized-chunk-size 2000
+python scripts/build_vocab_and_tokenize.py --sessions-glob "data/sessions/day_*.parquet" --split test --vocab-in data/vocab.json --tokenized-out data/tokenized/sessions_test.pt --parquet-batch-size 1000 --tokenized-chunk-size 2000
 ```
+
+For large splits, `sessions_*.pt` is a small manifest with paths to chunk files. This avoids building one giant in-memory Python list before saving.
 
 ## Option 2: Kaggle (`/kaggle/working` persistence)
 

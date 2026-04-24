@@ -17,6 +17,14 @@ def _make_event(event_id: str, auth_type: str = "Kerberos", logon_type: str = "N
     }
 
 
+def _load_torch_artifact(path: Path):
+    torch = pytest.importorskip("torch")
+    try:
+        return torch.load(path, weights_only=False)
+    except TypeError:
+        return torch.load(path)
+
+
 @pytest.fixture
 def vocab_path(tmp_path: Path) -> Path:
     vocab = {
@@ -150,6 +158,34 @@ def test_save_tokenized_sessions_pt_with_stats_returns_named_result(
     assert result.path == tmp_path / "sessions.pt"
     assert result.unknown_events == 1
     assert result.total_events == 1
+
+
+def test_save_tokenized_sessions_pt_chunked_writes_manifest_and_chunks(
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    sessions = [
+        {"session_id": f"s{idx}", "events": [_make_event("4624", "Kerberos", "Network")]}
+        for idx in range(3)
+    ]
+
+    result = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=sessions,
+        output_path=tmp_path / "sessions.pt",
+        chunk_size=2,
+    )
+
+    artifact = _load_torch_artifact(result.path)
+    assert artifact["format"] == "tokenized_session_chunk_manifest_v1"
+    assert artifact["chunk_count"] == 2
+    assert artifact["session_count"] == 3
+
+    first_chunk = _load_torch_artifact(tmp_path / artifact["chunks"][0])
+    assert first_chunk["format"] == "tokenized_session_chunk_v1"
+    assert first_chunk["input_ids"].shape[1] == 8
+    assert first_chunk["attention_mask"].shape[1] == 8
 
 
 def test_tokenize_can_keep_first_events_when_truncating_right(vocab_path: Path) -> None:
