@@ -327,16 +327,6 @@ def main() -> None:
         f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' "
         f"(days {split_start}-{split_end})."
     )
-    session_count, _, _ = _summarize_session_stream(
-        parquet_paths,
-        parquet_batch_size=args.parquet_batch_size,
-    )
-    if session_count == 0:
-        raise RuntimeError("Loaded 0 sessions from parquet files.")
-    _ensure_session_stream_has_events(
-        parquet_paths,
-        parquet_batch_size=args.parquet_batch_size,
-    )
 
     if args.vocab_in:
         vocab_path = Path(args.vocab_in)
@@ -355,30 +345,14 @@ def main() -> None:
         print(f"Built vocabulary from split '{args.split}' sessions.")
 
     _validate_vocab_size(vocab)
-    total_events, missing_event_ids, distinct_observed_tokens = _analyze_event_token_space(
-        parquet_paths,
-        parquet_batch_size=args.parquet_batch_size,
-    )
-    if total_events and missing_event_ids:
-        print(
-            "Warning: events with missing/placeholder event_id detected "
-            f"({missing_event_ids:,}/{total_events:,}). "
-            "If this is high, check Drain3 enrichment before tokenization."
-        )
-    learned_token_count = max(0, len(vocab) - len(LogTokenizer.REQUIRED_SPECIAL_TOKENS))
-    if total_events >= 50 and learned_token_count < 50 and distinct_observed_tokens >= 50:
-        print(
-            "Warning: learned vocabulary is small for this split "
-            f"({learned_token_count:,} learned tokens; "
-            f"{distinct_observed_tokens:,} distinct observed event tokens). "
-            "If unexpected, check event_id/template_id generation and --min-freq."
-        )
 
     save_stats = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
         sessions=iter_sessions(parquet_paths, parquet_batch_size=args.parquet_batch_size),
         output_path=args.tokenized_out,
         chunk_size=args.tokenized_chunk_size,
     )
+    if save_stats.total_events == 0:
+        raise RuntimeError("Tokenization completed but found 0 events in the selected session shards.")
 
     print("\nArtifacts generated successfully:")
     print(f"- Vocabulary size: {len(vocab):,}")
