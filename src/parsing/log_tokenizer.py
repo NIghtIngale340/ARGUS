@@ -3,7 +3,7 @@ import json
 import shutil
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Literal, Mapping, Sequence, Tuple, Union, overload
+from typing import Any, Callable, Dict, Iterable, List, Literal, Mapping, Optional, Sequence, Tuple, Union, overload
 
 try:
     from .vocab_builder import build_event_token
@@ -24,6 +24,8 @@ class TokenizedSaveStats:
     path: Path
     unknown_events: int
     total_events: int
+    session_count: int = 0
+    chunk_count: int = 0
 
 
 TOKENIZED_CHUNK_MANIFEST_FORMAT = "tokenized_session_chunk_manifest_v1"
@@ -209,11 +211,18 @@ class LogTokenizer:
         sessions: Iterable[Any],
         output_path: Union[str, Path],
         chunk_size: int = 10_000,
+        token_id_dtype: Any = None,
+        attention_mask_dtype: Any = None,
+        progress_callback: Optional[Callable[[int, int, Path], None]] = None,
     ) -> TokenizedSaveStats:
         if torch is None:
             raise RuntimeError("PyTorch is not installed. Install torch to save .pt artifacts.")
         if chunk_size <= 0:
             raise ValueError("chunk_size must be > 0")
+        if token_id_dtype is None:
+            token_id_dtype = torch.int32
+        if attention_mask_dtype is None:
+            attention_mask_dtype = torch.bool
 
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -236,11 +245,13 @@ class LogTokenizer:
             chunk_artifact = {
                 "format": TOKENIZED_CHUNK_FORMAT,
                 "session_ids": list(pending_session_ids),
-                "input_ids": torch.tensor(pending_input_ids, dtype=torch.long),
-                "attention_mask": torch.tensor(pending_attention_masks, dtype=torch.long),
+                "input_ids": torch.tensor(pending_input_ids, dtype=token_id_dtype),
+                "attention_mask": torch.tensor(pending_attention_masks, dtype=attention_mask_dtype),
             }
             torch.save(chunk_artifact, chunk_path)
             chunk_paths.append(str(chunk_path.relative_to(output.parent)))
+            if progress_callback is not None:
+                progress_callback(len(chunk_paths), session_count, chunk_path)
             pending_session_ids.clear()
             pending_input_ids.clear()
             pending_attention_masks.clear()
@@ -285,8 +296,8 @@ class LogTokenizer:
                 serialized.append(
                     {
                         "session_id": session_id,
-                        "input_ids": torch.tensor(input_ids, dtype=torch.long),
-                        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+                        "input_ids": torch.tensor(input_ids, dtype=token_id_dtype),
+                        "attention_mask": torch.tensor(attention_mask, dtype=attention_mask_dtype),
                     }
                 )
             torch.save(serialized, output)
@@ -295,4 +306,6 @@ class LogTokenizer:
             path=output,
             unknown_events=unknown_events,
             total_events=total_events,
+            session_count=session_count,
+            chunk_count=len(chunk_paths),
         )

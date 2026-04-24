@@ -2,6 +2,7 @@ import argparse
 from collections import Counter
 import re
 from pathlib import Path
+import shutil
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 import sys
 
@@ -18,6 +19,21 @@ SPLIT_DAY_RANGES = {
     "val": (41, 50),
     "test": (51, 58),
     "all": (1, 58),
+}
+
+TORCH_DTYPE_BYTES = {
+    "bool": 1,
+    "uint8": 1,
+    "int16": 2,
+    "int32": 4,
+    "int64": 8,
+}
+
+TORCH_DTYPE_MAX_VALUES = {
+    "uint8": 255,
+    "int16": 32_767,
+    "int32": 2_147_483_647,
+    "int64": 9_223_372_036_854_775_807,
 }
 
 
@@ -82,6 +98,31 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10_000,
         help="Number of tokenized sessions to keep in memory before flushing a chunk",
+    )
+    parser.add_argument(
+        "--token-id-dtype",
+        type=str,
+        default="int32",
+        choices=("int16", "int32", "int64"),
+        help="Torch dtype used to store chunked input_ids. int32 is usually enough and halves disk use vs int64.",
+    )
+    parser.add_argument(
+        "--attention-mask-dtype",
+        type=str,
+        default="bool",
+        choices=("bool", "uint8", "int32", "int64"),
+        help="Torch dtype used to store chunked attention_mask tensors.",
+    )
+    parser.add_argument(
+        "--progress-interval-rows",
+        type=int,
+        default=250_000,
+        help="Emit progress after this many rows per shard during vocab/tokenization passes.",
+    )
+    parser.add_argument(
+        "--allow-insufficient-disk",
+        action="store_true",
+        help="Run even when the estimated tokenized artifact size is larger than available disk.",
     )
     return parser.parse_args()
 
@@ -208,11 +249,29 @@ def _filter_paths_for_split(parquet_paths: Iterable[Path], split: str) -> List[P
 def iter_sessions(
     parquet_paths: Iterable[Path],
     parquet_batch_size: int = 2_000,
+    progress_label: Optional[str] = None,
+    progress_interval_rows: int = 250_000,
 ) -> Iterable[Dict[str, Any]]:
+    parquet_paths = list(parquet_paths)
     coercion_stats: Dict[str, int] = {}
-    for parquet_path in parquet_paths:
-        parquet_file = pq.ParquetFile(parquet_path)
+    for shard_index, parquet_path in enumerate(parquet_paths, start=1):
+        try:
+            parquet_file = pq.ParquetFile(parquet_path)
+        except Exception as exc:
+            raise RuntimeError(f"Unable to read session parquet shard: {parquet_path}") from exc
+
+        shard_rows = parquet_file.metadata.num_rows
+        if progress_label:
+            print(
+                f"[{progress_label}] shard {shard_index}/{len(parquet_paths)}: "
+                f"{parquet_path.name} ({shard_rows:,} rows)",
+                flush=True,
+            )
+
+        rows_seen = 0
+        next_progress_at = max(progress_interval_rows, 1)
         for batch in parquet_file.iter_batches(batch_size=parquet_batch_size):
+            batch_rows = batch.num_rows
             for row in batch.to_pylist():
                 normalized_row = dict(row)
                 normalized_row["events"] = _coerce_events(
@@ -220,6 +279,15 @@ def iter_sessions(
                     stats=coercion_stats,
                 )
                 yield normalized_row
+            rows_seen += batch_rows
+            if progress_label and (rows_seen >= next_progress_at or rows_seen >= shard_rows):
+                print(
+                    f"[{progress_label}] {parquet_path.name}: "
+                    f"{rows_seen:,}/{shard_rows:,} rows",
+                    flush=True,
+                )
+                while next_progress_at <= rows_seen:
+                    next_progress_at += max(progress_interval_rows, 1)
 
     invalid_containers = coercion_stats.get("invalid_event_containers", 0)
     dropped_events = coercion_stats.get("dropped_events", 0)
@@ -287,16 +355,110 @@ def _build_vocab_from_session_shards(
     min_freq: int,
     save_path: str,
     parquet_batch_size: int,
+    progress_interval_rows: int,
 ) -> Dict[str, int]:
     vocab_builder = VocabBuilder(min_freq=min_freq)
     token_counts: Counter[str] = Counter()
 
-    for session in iter_sessions(parquet_paths, parquet_batch_size=parquet_batch_size):
+    for session in iter_sessions(
+        parquet_paths,
+        parquet_batch_size=parquet_batch_size,
+        progress_label="vocab",
+        progress_interval_rows=progress_interval_rows,
+    ):
         for event in session.get("events", []):
             if isinstance(event, Mapping):
                 token_counts[build_event_token(event)] += 1
 
     return vocab_builder.build_vocab_from_counts(token_counts, save_path=save_path)
+
+
+def _format_bytes(byte_count: int) -> str:
+    value = float(byte_count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TB"
+
+
+def _torch_dtype(dtype_name: str) -> Any:
+    import torch
+
+    return getattr(torch, dtype_name)
+
+
+def _validate_token_id_dtype(vocab: Mapping[str, int], dtype_name: str) -> None:
+    max_token_id = max(vocab.values()) if vocab else 0
+    dtype_max = TORCH_DTYPE_MAX_VALUES[dtype_name]
+    if max_token_id > dtype_max:
+        raise RuntimeError(
+            f"--token-id-dtype {dtype_name} cannot store max token id {max_token_id:,}. "
+            "Use a wider dtype such as int32 or int64."
+        )
+
+
+def _read_parquet_metadata(parquet_paths: Iterable[Path]) -> tuple[int, Dict[Path, int]]:
+    total_rows = 0
+    rows_by_path: Dict[Path, int] = {}
+    for parquet_path in parquet_paths:
+        try:
+            parquet_file = pq.ParquetFile(parquet_path)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Invalid or unreadable parquet shard: {parquet_path}. "
+                "Rebuild or replace this shard before tokenization."
+            ) from exc
+
+        rows = parquet_file.metadata.num_rows
+        rows_by_path[parquet_path] = rows
+        total_rows += rows
+    return total_rows, rows_by_path
+
+
+def _warn_if_split_days_missing(parquet_paths: Iterable[Path], split: str) -> None:
+    if split == "all":
+        return
+
+    start_day, end_day = SPLIT_DAY_RANGES[split]
+    observed_days = {_extract_day_from_shard_name(path) for path in parquet_paths}
+    missing_days = [day for day in range(start_day, end_day + 1) if day not in observed_days]
+    if missing_days:
+        preview = ", ".join(f"{day:02d}" for day in missing_days[:10])
+        suffix = "" if len(missing_days) <= 10 else f", ... (+{len(missing_days) - 10} more)"
+        print(
+            f"Warning: split '{split}' is missing expected day shard(s): {preview}{suffix}.",
+            flush=True,
+        )
+
+
+def _preflight_tokenized_output(
+    tokenized_out: str,
+    session_count: int,
+    max_len: int,
+    token_id_dtype: str,
+    attention_mask_dtype: str,
+    allow_insufficient_disk: bool,
+) -> None:
+    bytes_per_token = TORCH_DTYPE_BYTES[token_id_dtype] + TORCH_DTYPE_BYTES[attention_mask_dtype]
+    estimated_bytes = session_count * max_len * bytes_per_token
+    output_parent = Path(tokenized_out).parent
+    output_parent.mkdir(parents=True, exist_ok=True)
+    free_bytes = shutil.disk_usage(output_parent.resolve()).free
+
+    print(
+        "Tokenized output estimate: "
+        f"{session_count:,} sessions x max_len={max_len:,} x {bytes_per_token} bytes/token "
+        f"~= {_format_bytes(estimated_bytes)} "
+        f"(free disk: {_format_bytes(free_bytes)}).",
+        flush=True,
+    )
+    if estimated_bytes > free_bytes * 0.9 and not allow_insufficient_disk:
+        raise RuntimeError(
+            "Estimated tokenized output is larger than available disk. "
+            "Reduce --max-len, rebuild sessions with fewer windows, increase storage, "
+            "or pass --allow-insufficient-disk if you intentionally want to try anyway."
+        )
 
 
 def main() -> None:
@@ -310,6 +472,8 @@ def main() -> None:
         raise ValueError("--parquet-batch-size must be > 0")
     if args.tokenized_chunk_size <= 0:
         raise ValueError("--tokenized-chunk-size must be > 0")
+    if args.progress_interval_rows <= 0:
+        raise ValueError("--progress-interval-rows must be > 0")
 
     all_parquet_paths = sorted(Path().glob(args.sessions_glob))
     if not all_parquet_paths:
@@ -321,6 +485,16 @@ def main() -> None:
 
     split_start, split_end = SPLIT_DAY_RANGES[args.split]
     print(f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' (days {split_start}-{split_end}).")
+    _warn_if_split_days_missing(parquet_paths, split=args.split)
+    session_count, _ = _read_parquet_metadata(parquet_paths)
+    _preflight_tokenized_output(
+        tokenized_out=args.tokenized_out,
+        session_count=session_count,
+        max_len=args.max_len,
+        token_id_dtype=args.token_id_dtype,
+        attention_mask_dtype=args.attention_mask_dtype,
+        allow_insufficient_disk=args.allow_insufficient_disk,
+    )
 
     if args.vocab_in:
         vocab_path = Path(args.vocab_in)
@@ -333,17 +507,34 @@ def main() -> None:
             min_freq=args.min_freq,
             save_path=args.vocab_out,
             parquet_batch_size=args.parquet_batch_size,
+            progress_interval_rows=args.progress_interval_rows,
         )
         vocab_path = Path(args.vocab_out)
         tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=args.max_len)
         print(f"Built vocabulary from split '{args.split}' sessions.")
 
     _validate_vocab_size(vocab)
+    _validate_token_id_dtype(vocab, args.token_id_dtype)
+
+    def report_chunk(chunk_count: int, processed_sessions: int, chunk_path: Path) -> None:
+        print(
+            f"[tokenize] wrote chunk {chunk_count:,} "
+            f"({processed_sessions:,}/{session_count:,} sessions): {chunk_path}",
+            flush=True,
+        )
 
     save_stats = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
-        sessions=iter_sessions(parquet_paths, parquet_batch_size=args.parquet_batch_size),
+        sessions=iter_sessions(
+            parquet_paths,
+            parquet_batch_size=args.parquet_batch_size,
+            progress_label="tokenize",
+            progress_interval_rows=args.progress_interval_rows,
+        ),
         output_path=args.tokenized_out,
         chunk_size=args.tokenized_chunk_size,
+        token_id_dtype=_torch_dtype(args.token_id_dtype),
+        attention_mask_dtype=_torch_dtype(args.attention_mask_dtype),
+        progress_callback=report_chunk,
     )
     if save_stats.total_events == 0:
         raise RuntimeError("Tokenization completed but found 0 events in the selected session shards.")
@@ -352,6 +543,8 @@ def main() -> None:
     print(f"- Vocabulary size: {len(vocab):,}")
     print(f"- Vocab path: {vocab_path}")
     print(f"- Tokenized path: {save_stats.path}")
+    print(f"- Sessions tokenized: {save_stats.session_count:,}")
+    print(f"- Chunk files: {save_stats.chunk_count:,}")
     print(f"- Unknown events: {save_stats.unknown_events:,}/{save_stats.total_events:,}")
 
 

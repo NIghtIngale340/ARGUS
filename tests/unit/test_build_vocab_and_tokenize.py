@@ -6,7 +6,12 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from scripts.build_vocab_and_tokenize import _coerce_events, _warn_if_event_token_space_looks_suspicious
+from scripts.build_vocab_and_tokenize import (
+    _coerce_events,
+    _format_bytes,
+    _validate_token_id_dtype,
+    _warn_if_event_token_space_looks_suspicious,
+)
 
 torch = pytest.importorskip("torch")
 
@@ -126,6 +131,24 @@ def test_warn_if_event_token_space_detects_tiny_vocab(capsys) -> None:
     _warn_if_event_token_space_looks_suspicious(sessions, vocab)
 
     assert "learned vocabulary is small" in capsys.readouterr().out
+
+
+def test_validate_token_id_dtype_rejects_too_narrow_dtype() -> None:
+    vocab = {
+        "[CLS]": 0,
+        "[SEP]": 1,
+        "[MASK]": 2,
+        "[PAD]": 3,
+        "[UNK]": 4,
+        "large-token": 300,
+    }
+
+    with pytest.raises(RuntimeError, match="cannot store max token id"):
+        _validate_token_id_dtype(vocab, "uint8")
+
+
+def test_format_bytes_uses_human_units() -> None:
+    assert _format_bytes(1024 * 1024) == "1.0 MB"
 
 
 def test_existing_vocab_can_be_reused_for_validation_split(tmp_path: Path) -> None:

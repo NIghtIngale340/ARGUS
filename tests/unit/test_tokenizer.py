@@ -186,6 +186,33 @@ def test_save_tokenized_sessions_pt_chunked_writes_manifest_and_chunks(
     assert first_chunk["format"] == "tokenized_session_chunk_v1"
     assert first_chunk["input_ids"].shape[1] == 8
     assert first_chunk["attention_mask"].shape[1] == 8
+    assert first_chunk["input_ids"].dtype == torch.int32
+    assert first_chunk["attention_mask"].dtype == torch.bool
+
+
+def test_save_tokenized_sessions_pt_chunked_reports_progress(
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    sessions = [
+        {"session_id": f"s{idx}", "events": [_make_event("4624", "Kerberos", "Network")]}
+        for idx in range(2)
+    ]
+    progress_calls = []
+
+    result = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=sessions,
+        output_path=tmp_path / "sessions.pt",
+        chunk_size=1,
+        progress_callback=lambda chunk_count, session_count, path: progress_calls.append(
+            (chunk_count, session_count, path.name)
+        ),
+    )
+
+    assert result.session_count == 2
+    assert result.chunk_count == 2
+    assert progress_calls == [(1, 1, "chunk_00000.pt"), (2, 2, "chunk_00001.pt")]
 
 
 def test_tokenize_can_keep_first_events_when_truncating_right(vocab_path: Path) -> None:
