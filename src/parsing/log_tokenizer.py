@@ -105,6 +105,16 @@ class LogTokenizer:
     def _encode_events(self, events: Iterable[Mapping[str, Any]]) -> List[int]:
         return [self.encode_event(event) for event in events]
 
+    def _encode_events_with_unknown_count(self, events: Iterable[Mapping[str, Any]]) -> Tuple[List[int], int]:
+        token_ids: List[int] = []
+        unknown_events = 0
+        for event in events:
+            token_id = self.encode_event(event)
+            token_ids.append(token_id)
+            if token_id == self.unk_token:
+                unknown_events += 1
+        return token_ids, unknown_events
+
     def _trim_event_tokens(self, event_token_ids: List[int]) -> List[int]:
         max_events = self.max_len - 2
         if len(event_token_ids) > max_events:
@@ -121,6 +131,16 @@ class LogTokenizer:
             sequence.extend([self.pad_token] * padding_needed)
         return sequence
 
+    def _build_sequence_with_attention_mask(self, event_token_ids: List[int]) -> Tuple[List[int], List[int]]:
+        event_token_ids = self._trim_event_tokens(event_token_ids)
+        sequence = [self.cls_token] + event_token_ids + [self.sep_token]
+        non_padding_tokens = len(sequence)
+        padding_needed = self.max_len - non_padding_tokens
+        if padding_needed > 0:
+            sequence.extend([self.pad_token] * padding_needed)
+        attention_mask = [1] * non_padding_tokens + [0] * max(padding_needed, 0)
+        return sequence, attention_mask
+
     def tokenize(self, session: Any) -> List[int]:
         session_data = self._coerce_session(session)
         events = session_data.get("events", [])
@@ -130,9 +150,10 @@ class LogTokenizer:
         return [0 if token_id == self.pad_token else 1 for token_id in token_ids]
 
     def tokenize_with_attention_mask(self, session: Any) -> Tuple[List[int], List[int]]:
-        token_ids = self.tokenize(session)
-        attention_mask = self.build_attention_mask(token_ids)
-        return token_ids, attention_mask
+        session_data = self._coerce_session(session)
+        events = session_data.get("events", [])
+        event_token_ids = self._encode_events(events)
+        return self._build_sequence_with_attention_mask(event_token_ids)
 
     def decode(self, ids: Sequence[int]) -> List[str]:
         return [self.id_to_token.get(int(idx), "[UNK]") for idx in ids]
@@ -172,11 +193,12 @@ class LogTokenizer:
         total_events = 0
         for idx, session in enumerate(sessions):
             session_data = self._coerce_session(session)
-            event_token_ids = self._encode_events(session_data.get("events", []))
+            event_token_ids, session_unknown_events = self._encode_events_with_unknown_count(
+                session_data.get("events", [])
+            )
             total_events += len(event_token_ids)
-            unknown_events += sum(1 for token_id in event_token_ids if token_id == self.unk_token)
-            input_ids = self._build_sequence(event_token_ids)
-            attention_mask = self.build_attention_mask(input_ids)
+            unknown_events += session_unknown_events
+            input_ids, attention_mask = self._build_sequence_with_attention_mask(event_token_ids)
             serialized.append(
                 {
                     "session_id": session_data.get("session_id", idx),
@@ -271,11 +293,12 @@ class LogTokenizer:
             if not resume_input_already_skipped and session_count <= resume_session_count:
                 continue
 
-            event_token_ids = self._encode_events(session_data.get("events", []))
+            event_token_ids, session_unknown_events = self._encode_events_with_unknown_count(
+                session_data.get("events", [])
+            )
             total_events += len(event_token_ids)
-            unknown_events += sum(1 for token_id in event_token_ids if token_id == self.unk_token)
-            input_ids = self._build_sequence(event_token_ids)
-            attention_mask = self.build_attention_mask(input_ids)
+            unknown_events += session_unknown_events
+            input_ids, attention_mask = self._build_sequence_with_attention_mask(event_token_ids)
 
             pending_session_ids.append(session_data.get("session_id", idx))
             pending_input_ids.append(input_ids)

@@ -247,3 +247,57 @@ def test_script_can_emit_chunked_tokenized_manifest(tmp_path: Path) -> None:
     first_chunk = _load_torch_artifact(tmp_path / "data" / "tokenized" / artifact["chunks"][0])
     assert first_chunk["format"] == "tokenized_session_chunk_v1"
     assert first_chunk["input_ids"].shape[1] == 8
+
+
+def test_script_can_reuse_existing_train_vocab_and_write_progress_log(tmp_path: Path) -> None:
+    _write_session_shard(tmp_path / "data" / "sessions" / "day_01.parquet", "train-event")
+    vocab_path = tmp_path / "data" / "vocab.json"
+    vocab_path.parent.mkdir(parents=True, exist_ok=True)
+    vocab_path.write_text(
+        json.dumps(
+            {
+                "[CLS]": 0,
+                "[SEP]": 1,
+                "[MASK]": 2,
+                "[PAD]": 3,
+                "[UNK]": 4,
+                "cached-event_Kerberos_Network": 5,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cmd = [
+        sys.executable,
+        str(SCRIPT_PATH),
+        "--sessions-glob",
+        "data/sessions/day_*.parquet",
+        "--split",
+        "train",
+        "--vocab-out",
+        "data/vocab.json",
+        "--reuse-vocab-if-exists",
+        "--tokenized-out",
+        "data/tokenized/sessions_train.pt",
+        "--min-freq",
+        "1",
+        "--max-len",
+        "8",
+        "--tokenized-chunk-size",
+        "1",
+        "--progress-log",
+        "data/tokenized/progress_train.jsonl",
+    ]
+    subprocess.run(cmd, cwd=tmp_path, check=True)
+
+    vocab = json.loads(vocab_path.read_text(encoding="utf-8"))
+    assert "cached-event_Kerberos_Network" in vocab
+    assert "train-event_Kerberos_Network" not in vocab
+
+    progress_events = [
+        json.loads(line)["event"]
+        for line in (tmp_path / "data" / "tokenized" / "progress_train.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert progress_events == ["start", "chunk_written", "complete"]

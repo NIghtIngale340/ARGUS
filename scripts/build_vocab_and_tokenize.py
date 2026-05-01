@@ -1,10 +1,12 @@
 import argparse
 from collections import Counter
+import json
 import re
 from pathlib import Path
 import shutil
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 import sys
+import time
 
 import pandas as pd
 import pyarrow.parquet as pq
@@ -131,6 +133,20 @@ def parse_args() -> argparse.Namespace:
             "Skip a complete tokenized manifest or continue an incomplete chunk directory "
             "instead of deleting existing tokenized chunks."
         ),
+    )
+    parser.add_argument(
+        "--reuse-vocab-if-exists",
+        action="store_true",
+        help=(
+            "When building a vocabulary with --vocab-out, load that existing vocab instead of "
+            "rebuilding it. Use only when the existing vocab was built from the same train split."
+        ),
+    )
+    parser.add_argument(
+        "--progress-log",
+        type=str,
+        default=None,
+        help="Optional JSONL file for durable tokenization progress events.",
     )
     return parser.parse_args()
 
@@ -495,6 +511,17 @@ def _load_torch_artifact(path: Path) -> Any:
         return torch.load(path, map_location="cpu")
 
 
+def _append_progress_log(progress_log: Optional[str], event: Mapping[str, Any]) -> None:
+    if not progress_log:
+        return
+
+    log_path = Path(progress_log)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"ts": time.time(), **dict(event)}
+    with log_path.open("a", encoding="utf-8") as file_obj:
+        file_obj.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
 def _tokenized_manifest_complete(tokenized_out: str, expected_session_count: int) -> bool:
     output = Path(tokenized_out)
     if not output.exists() or output.stat().st_size <= 0:
@@ -583,6 +610,16 @@ def main() -> None:
     print(f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' (days {split_start}-{split_end}).")
     _warn_if_split_days_missing(parquet_paths, split=args.split)
     session_count, _ = _read_parquet_metadata(parquet_paths)
+    _append_progress_log(
+        args.progress_log,
+        {
+            "event": "start",
+            "split": args.split,
+            "session_count": session_count,
+            "shard_count": len(parquet_paths),
+            "tokenized_out": args.tokenized_out,
+        },
+    )
 
     requested_vocab_path = Path(args.vocab_in) if args.vocab_in else Path(args.vocab_out)
     if (
@@ -594,6 +631,15 @@ def main() -> None:
             f"[SKIP] split '{args.split}' already has a complete tokenized manifest: "
             f"{args.tokenized_out}",
             flush=True,
+        )
+        _append_progress_log(
+            args.progress_log,
+            {
+                "event": "skip_complete",
+                "split": args.split,
+                "session_count": session_count,
+                "tokenized_out": args.tokenized_out,
+            },
         )
         return
 
@@ -608,6 +654,16 @@ def main() -> None:
             f"[RESUME] split '{args.split}' has {resume_session_count:,} existing "
             f"tokenized session(s); {preflight_session_count:,} remaining.",
             flush=True,
+        )
+        _append_progress_log(
+            args.progress_log,
+            {
+                "event": "resume",
+                "split": args.split,
+                "existing_sessions": resume_session_count,
+                "remaining_sessions": preflight_session_count,
+                "tokenized_out": args.tokenized_out,
+            },
         )
 
     _preflight_tokenized_output(
@@ -624,6 +680,15 @@ def main() -> None:
         tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=args.max_len)
         vocab = tokenizer.vocab
         print(f"Loaded existing vocabulary from: {vocab_path}")
+    elif args.reuse_vocab_if_exists and Path(args.vocab_out).exists():
+        vocab_path = Path(args.vocab_out)
+        tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=args.max_len)
+        vocab = tokenizer.vocab
+        print(
+            f"Reusing existing vocabulary from: {vocab_path}. "
+            "Delete this file if train sessions or --min-freq changed.",
+            flush=True,
+        )
     else:
         vocab = _build_vocab_from_session_shards(
             parquet_paths,
@@ -644,6 +709,18 @@ def main() -> None:
             f"[tokenize] wrote chunk {chunk_count:,} "
             f"({processed_sessions:,}/{session_count:,} sessions): {chunk_path}",
             flush=True,
+        )
+        _append_progress_log(
+            args.progress_log,
+            {
+                "event": "chunk_written",
+                "split": args.split,
+                "chunk_count": chunk_count,
+                "processed_sessions": processed_sessions,
+                "session_count": session_count,
+                "chunk_path": str(chunk_path),
+                "tokenized_out": args.tokenized_out,
+            },
         )
 
     save_stats = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
@@ -678,6 +755,20 @@ def main() -> None:
     print(f"- Sessions tokenized: {save_stats.session_count:,}")
     print(f"- Chunk files: {save_stats.chunk_count:,}")
     print(f"- Unknown events: {save_stats.unknown_events:,}/{save_stats.total_events:,}")
+    _append_progress_log(
+        args.progress_log,
+        {
+            "event": "complete",
+            "split": args.split,
+            "session_count": save_stats.session_count,
+            "chunk_count": save_stats.chunk_count,
+            "unknown_events": save_stats.unknown_events,
+            "total_events": save_stats.total_events,
+            "vocab_size": len(vocab),
+            "vocab_path": str(vocab_path),
+            "tokenized_out": str(save_stats.path),
+        },
+    )
 
 
 
