@@ -215,6 +215,71 @@ def test_save_tokenized_sessions_pt_chunked_reports_progress(
     assert progress_calls == [(1, 1, "chunk_00000.pt"), (2, 2, "chunk_00001.pt")]
 
 
+def test_save_tokenized_sessions_pt_chunked_can_resume_existing_chunks(
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    sessions = [
+        {"session_id": f"s{idx}", "events": [_make_event("4624", "Kerberos", "Network")]}
+        for idx in range(5)
+    ]
+    output_path = tmp_path / "sessions.pt"
+
+    tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=sessions[:4],
+        output_path=output_path,
+        chunk_size=2,
+    )
+    result = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=sessions,
+        output_path=output_path,
+        chunk_size=2,
+        resume=True,
+    )
+
+    artifact = _load_torch_artifact(output_path)
+    resumed_chunk = _load_torch_artifact(tmp_path / artifact["chunks"][-1])
+
+    assert result.session_count == 5
+    assert result.chunk_count == 3
+    assert artifact["session_count"] == 5
+    assert artifact["chunk_count"] == 3
+    assert resumed_chunk["session_ids"] == ["s4"]
+
+
+def test_save_tokenized_sessions_pt_chunked_can_resume_after_source_skip(
+    vocab_path: Path,
+    tmp_path: Path,
+) -> None:
+    tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=8)
+    sessions = [
+        {"session_id": f"s{idx}", "events": [_make_event("4624", "Kerberos", "Network")]}
+        for idx in range(5)
+    ]
+    output_path = tmp_path / "sessions.pt"
+
+    tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=sessions[:4],
+        output_path=output_path,
+        chunk_size=2,
+    )
+    result = tokenizer.save_tokenized_sessions_pt_chunked_with_stats(
+        sessions=sessions[4:],
+        output_path=output_path,
+        chunk_size=2,
+        resume=True,
+        resume_input_already_skipped=True,
+    )
+
+    artifact = _load_torch_artifact(output_path)
+    resumed_chunk = _load_torch_artifact(tmp_path / artifact["chunks"][-1])
+
+    assert result.session_count == 5
+    assert result.chunk_count == 3
+    assert resumed_chunk["session_ids"] == ["s4"]
+
+
 def test_tokenize_can_keep_first_events_when_truncating_right(vocab_path: Path) -> None:
     tokenizer = LogTokenizer(vocab_path=vocab_path, max_len=6, truncation_side="right")
     session = {

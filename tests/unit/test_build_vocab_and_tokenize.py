@@ -11,6 +11,7 @@ from scripts.build_vocab_and_tokenize import (
     _format_bytes,
     _validate_token_id_dtype,
     _warn_if_event_token_space_looks_suspicious,
+    iter_sessions,
 )
 
 torch = pytest.importorskip("torch")
@@ -149,6 +150,21 @@ def test_validate_token_id_dtype_rejects_too_narrow_dtype() -> None:
 
 def test_format_bytes_uses_human_units() -> None:
     assert _format_bytes(1024 * 1024) == "1.0 MB"
+
+
+def test_iter_sessions_can_skip_rows_before_decoding(tmp_path: Path) -> None:
+    _write_session_shard(tmp_path / "data" / "sessions" / "day_01.parquet", "event-a")
+    _write_session_shard(tmp_path / "data" / "sessions" / "day_02.parquet", "event-b")
+
+    sessions = list(
+        iter_sessions(
+            sorted((tmp_path / "data" / "sessions").glob("day_*.parquet")),
+            parquet_batch_size=1,
+            skip_rows=1,
+        )
+    )
+
+    assert [session["session_id"] for session in sessions] == ["session-event-b"]
 
 
 def test_existing_vocab_can_be_reused_for_validation_split(tmp_path: Path) -> None:

@@ -124,6 +124,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run even when the estimated tokenized artifact size is larger than available disk.",
     )
+    parser.add_argument(
+        "--resume-tokenized",
+        action="store_true",
+        help=(
+            "Skip a complete tokenized manifest or continue an incomplete chunk directory "
+            "instead of deleting existing tokenized chunks."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -251,8 +259,10 @@ def iter_sessions(
     parquet_batch_size: int = 2_000,
     progress_label: Optional[str] = None,
     progress_interval_rows: int = 250_000,
+    skip_rows: int = 0,
 ) -> Iterable[Dict[str, Any]]:
     parquet_paths = list(parquet_paths)
+    skip_remaining = max(0, skip_rows)
     coercion_stats: Dict[str, int] = {}
     for shard_index, parquet_path in enumerate(parquet_paths, start=1):
         try:
@@ -272,6 +282,21 @@ def iter_sessions(
         next_progress_at = max(progress_interval_rows, 1)
         for batch in parquet_file.iter_batches(batch_size=parquet_batch_size):
             batch_rows = batch.num_rows
+            if skip_remaining >= batch_rows:
+                skip_remaining -= batch_rows
+                rows_seen += batch_rows
+                if progress_label and (rows_seen >= next_progress_at or rows_seen >= shard_rows):
+                    print(
+                        f"[{progress_label}] {parquet_path.name}: "
+                        f"{rows_seen:,}/{shard_rows:,} rows",
+                        flush=True,
+                    )
+                    while next_progress_at <= rows_seen:
+                        next_progress_at += max(progress_interval_rows, 1)
+                continue
+            if skip_remaining:
+                batch = batch.slice(skip_remaining)
+                skip_remaining = 0
             for row in batch.to_pylist():
                 normalized_row = dict(row)
                 normalized_row["events"] = _coerce_events(
@@ -461,6 +486,77 @@ def _preflight_tokenized_output(
         )
 
 
+def _load_torch_artifact(path: Path) -> Any:
+    import torch
+
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _tokenized_manifest_complete(tokenized_out: str, expected_session_count: int) -> bool:
+    output = Path(tokenized_out)
+    if not output.exists() or output.stat().st_size <= 0:
+        return False
+
+    try:
+        artifact = _load_torch_artifact(output)
+    except Exception:
+        return False
+    if not isinstance(artifact, Mapping):
+        return False
+    if artifact.get("format") != "tokenized_session_chunk_manifest_v1":
+        return False
+    if artifact.get("session_count") != expected_session_count:
+        return False
+
+    chunks = artifact.get("chunks")
+    if not isinstance(chunks, list) or artifact.get("chunk_count") != len(chunks):
+        return False
+    for relative_chunk_path in chunks:
+        if not isinstance(relative_chunk_path, str):
+            return False
+        chunk_path = output.parent / relative_chunk_path
+        if not chunk_path.exists() or chunk_path.stat().st_size <= 0:
+            return False
+    return True
+
+
+def _count_resumable_tokenized_sessions(tokenized_out: str) -> int:
+    output = Path(tokenized_out)
+    chunk_dir = output.parent / f"{output.stem}_chunks"
+    if not chunk_dir.exists():
+        return 0
+
+    session_count = 0
+    for expected_index, chunk_path in enumerate(sorted(chunk_dir.glob("chunk_*.pt"))):
+        if chunk_path.name != f"chunk_{expected_index:05d}.pt":
+            break
+        try:
+            chunk = _load_torch_artifact(chunk_path)
+        except Exception:
+            break
+        if not isinstance(chunk, Mapping) or chunk.get("format") != "tokenized_session_chunk_v1":
+            break
+
+        session_ids = chunk.get("session_ids")
+        input_ids = chunk.get("input_ids")
+        attention_mask = chunk.get("attention_mask")
+        if not isinstance(session_ids, list):
+            break
+        row_count = len(session_ids)
+        if row_count <= 0:
+            break
+        if getattr(input_ids, "shape", [None])[0] != row_count:
+            break
+        if getattr(attention_mask, "shape", [None])[0] != row_count:
+            break
+        session_count += row_count
+
+    return session_count
+
+
 def main() -> None:
     args = parse_args()
 
@@ -487,9 +583,36 @@ def main() -> None:
     print(f"Found {len(parquet_paths)} parquet shard(s) for split '{args.split}' (days {split_start}-{split_end}).")
     _warn_if_split_days_missing(parquet_paths, split=args.split)
     session_count, _ = _read_parquet_metadata(parquet_paths)
+
+    requested_vocab_path = Path(args.vocab_in) if args.vocab_in else Path(args.vocab_out)
+    if (
+        args.resume_tokenized
+        and requested_vocab_path.exists()
+        and _tokenized_manifest_complete(args.tokenized_out, session_count)
+    ):
+        print(
+            f"[SKIP] split '{args.split}' already has a complete tokenized manifest: "
+            f"{args.tokenized_out}",
+            flush=True,
+        )
+        return
+
+    resume_session_count = (
+        _count_resumable_tokenized_sessions(args.tokenized_out)
+        if args.resume_tokenized
+        else 0
+    )
+    preflight_session_count = max(0, session_count - resume_session_count)
+    if resume_session_count:
+        print(
+            f"[RESUME] split '{args.split}' has {resume_session_count:,} existing "
+            f"tokenized session(s); {preflight_session_count:,} remaining.",
+            flush=True,
+        )
+
     _preflight_tokenized_output(
         tokenized_out=args.tokenized_out,
-        session_count=session_count,
+        session_count=preflight_session_count,
         max_len=args.max_len,
         token_id_dtype=args.token_id_dtype,
         attention_mask_dtype=args.attention_mask_dtype,
@@ -529,14 +652,23 @@ def main() -> None:
             parquet_batch_size=args.parquet_batch_size,
             progress_label="tokenize",
             progress_interval_rows=args.progress_interval_rows,
+            skip_rows=resume_session_count,
         ),
         output_path=args.tokenized_out,
         chunk_size=args.tokenized_chunk_size,
         token_id_dtype=_torch_dtype(args.token_id_dtype),
         attention_mask_dtype=_torch_dtype(args.attention_mask_dtype),
         progress_callback=report_chunk,
+        resume=args.resume_tokenized,
+        resume_input_already_skipped=resume_session_count > 0,
     )
-    if save_stats.total_events == 0:
+    completed_from_existing_chunks = (
+        args.resume_tokenized
+        and resume_session_count >= session_count
+        and save_stats.session_count == session_count
+        and save_stats.chunk_count > 0
+    )
+    if save_stats.total_events == 0 and not completed_from_existing_chunks:
         raise RuntimeError("Tokenization completed but found 0 events in the selected session shards.")
 
     print("\nArtifacts generated successfully:")

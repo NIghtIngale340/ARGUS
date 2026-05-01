@@ -214,6 +214,8 @@ class LogTokenizer:
         token_id_dtype: Any = None,
         attention_mask_dtype: Any = None,
         progress_callback: Optional[Callable[[int, int, Path], None]] = None,
+        resume: bool = False,
+        resume_input_already_skipped: bool = False,
     ) -> TokenizedSaveStats:
         if torch is None:
             raise RuntimeError("PyTorch is not installed. Install torch to save .pt artifacts.")
@@ -228,16 +230,23 @@ class LogTokenizer:
         output.parent.mkdir(parents=True, exist_ok=True)
 
         chunk_dir = output.parent / f"{output.stem}_chunks"
-        if chunk_dir.exists():
+        resume_session_count = 0
+        chunk_paths: List[str] = []
+        if resume and chunk_dir.exists():
+            resume_session_count, chunk_paths = self._load_resumable_chunks(
+                chunk_dir=chunk_dir,
+                output_parent=output.parent,
+                chunk_size=chunk_size,
+            )
+        elif chunk_dir.exists():
             shutil.rmtree(chunk_dir)
 
         pending_session_ids: List[Any] = []
         pending_input_ids: List[List[int]] = []
         pending_attention_masks: List[List[int]] = []
-        chunk_paths: List[str] = []
         unknown_events = 0
         total_events = 0
-        session_count = 0
+        session_count = resume_session_count if resume_input_already_skipped else 0
 
         def flush_chunk(chunk_index: int) -> None:
             chunk_dir.mkdir(parents=True, exist_ok=True)
@@ -258,10 +267,13 @@ class LogTokenizer:
 
         for idx, session in enumerate(sessions):
             session_data = self._coerce_session(session)
+            session_count += 1
+            if not resume_input_already_skipped and session_count <= resume_session_count:
+                continue
+
             event_token_ids = self._encode_events(session_data.get("events", []))
             total_events += len(event_token_ids)
             unknown_events += sum(1 for token_id in event_token_ids if token_id == self.unk_token)
-            session_count += 1
             input_ids = self._build_sequence(event_token_ids)
             attention_mask = self.build_attention_mask(input_ids)
 
@@ -309,3 +321,55 @@ class LogTokenizer:
             session_count=session_count,
             chunk_count=len(chunk_paths),
         )
+
+    def _load_resumable_chunks(
+        self,
+        chunk_dir: Path,
+        output_parent: Path,
+        chunk_size: int,
+    ) -> Tuple[int, List[str]]:
+        existing_chunks = sorted(chunk_dir.glob("chunk_*.pt"))
+        session_count = 0
+        chunk_paths: List[str] = []
+        first_bad_index: Optional[int] = None
+
+        for expected_index, chunk_path in enumerate(existing_chunks):
+            if chunk_path.name != f"chunk_{expected_index:05d}.pt":
+                first_bad_index = expected_index
+                break
+            try:
+                chunk = torch.load(chunk_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                chunk = torch.load(chunk_path, map_location="cpu")
+            except Exception:
+                first_bad_index = expected_index
+                break
+            if not isinstance(chunk, Mapping) or chunk.get("format") != TOKENIZED_CHUNK_FORMAT:
+                first_bad_index = expected_index
+                break
+
+            session_ids = chunk.get("session_ids")
+            input_ids = chunk.get("input_ids")
+            attention_mask = chunk.get("attention_mask")
+            if not isinstance(session_ids, list):
+                first_bad_index = expected_index
+                break
+            row_count = len(session_ids)
+            if row_count <= 0:
+                first_bad_index = expected_index
+                break
+            if getattr(input_ids, "shape", [None])[0] != row_count:
+                first_bad_index = expected_index
+                break
+            if getattr(attention_mask, "shape", [None])[0] != row_count:
+                first_bad_index = expected_index
+                break
+
+            session_count += row_count
+            chunk_paths.append(str(chunk_path.relative_to(output_parent)))
+
+        if first_bad_index is not None:
+            for stale_chunk in existing_chunks[first_bad_index:]:
+                stale_chunk.unlink(missing_ok=True)
+
+        return session_count, chunk_paths
