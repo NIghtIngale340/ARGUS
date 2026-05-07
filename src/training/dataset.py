@@ -132,6 +132,7 @@ class TokenizedManifestDataset(IterableDataset):
             chunk = self._load_chunk(chunk_path)
             input_ids = chunk["input_ids"]
             attention_mask = chunk["attention_mask"]
+            session_ids = chunk.get("session_ids")
 
             for row_index in range(input_ids.shape[0]):
                 if (
@@ -143,6 +144,12 @@ class TokenizedManifestDataset(IterableDataset):
                 emitted_sessions += 1
 
                 yield {
+                    "session_id": (
+                        session_ids[row_index]
+                        if isinstance(session_ids, list)
+                        and row_index < len(session_ids)
+                        else emitted_sessions - 1
+                    ),
                     "input_ids": input_ids[row_index],
                     "attention_mask": attention_mask[row_index],
                 }
@@ -194,6 +201,13 @@ class TokenizedManifestDataset(IterableDataset):
         if input_ids.shape != attention_mask.shape:
             raise ValueError(
                 f"Tokenized chunk input_ids and attention_mask shapes differ: {chunk_path}"
+            )
+        session_ids = chunk.get("session_ids")
+        if session_ids is not None and (
+            not isinstance(session_ids, list) or len(session_ids) != input_ids.shape[0]
+        ):
+            raise ValueError(
+                f"Tokenized chunk session_ids must match tensor row count: {chunk_path}"
             )
 
         return chunk
