@@ -1,0 +1,53 @@
+{
+  "project": "ARGUS",
+  "phase": "2.5",
+  "checkpoint": "checkpoint_step_003501.pt",
+  "model": {
+    "architecture": "ARGUS-BERT (BertForMaskedLM)",
+    "vocab_size": 1233,
+    "max_seq_len": 16,
+    "hidden_size": 256,
+    "num_hidden_layers": 6,
+    "num_attention_heads": 8,
+    "intermediate_size": 1024,
+    "dropout": 0.1
+  },
+  "training": {
+    "objective": "MLM",
+    "best_val_loss": 0.4215,
+    "val_batches": 500,
+    "batch_size": 64,
+    "learning_rate": 0.0001,
+    "optimizer": "AdamW",
+    "total_steps_trained": 5000,
+    "best_step": 3501
+  },
+  "data": {
+    "dataset": "nightingale21/argus-tokenized-58day-verified",
+    "train_days": "1-40",
+    "val_days": "41-50",
+    "test_days": "51-58",
+    "token_format": "event_id_auth_type_logon_type",
+    "token_dtype": "int16",
+    "attention_mask_dtype": "bool"
+  },
+  "scoring": {
+    "method": "deterministic_all_event_mask",
+    "val_sessions_scored": 500000,
+    "score_limit_chunks": 100,
+    "score_summary": {
+      "mean": 3.604366,
+      "std": 3.677219,
+      "min": 0.007606,
+      "max": 14.707991
+    },
+    "thresholds": {
+      "p50": 4.141236,
+      "p90": 7.537313,
+      "p95": 10.696880,
+      "p99": 11.778649,
+      "p99.5": 11.778649
+    },
+    "notes": "p99 and p99.5 are identical due to score clustering in upper tail with max_seq_len=16 and deterministic masking. Structural, not a sampling issue."
+  }
+}
