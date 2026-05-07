@@ -9,10 +9,11 @@ from src.parsing.log_tokenizer import (
 )
 try:
     import torch
-    from torch.utils.data import IterableDataset
+    from torch.utils.data import IterableDataset, get_worker_info
 except ModuleNotFoundError:  # pragma: no cover - torch is a project dependency.
     torch = None  # type: ignore[assignment]
     IterableDataset = object  # type: ignore[misc,assignment]
+    get_worker_info = lambda: None  # type: ignore[assignment]
 
 @dataclass(frozen=True)
 class TokenizedManifestDatasetConfig:
@@ -55,7 +56,7 @@ class TokenizedManifestDataset(IterableDataset):
         manifest_path = self.config.manifest_path
         artifact = self._load_torch_artifact(manifest_path)
 
-        if not isinstance(artifact, dict):
+        if not isinstance(artifact, Mapping):
             raise ValueError(f"Tokenized manifest must be a mapping: {manifest_path}")
 
         if artifact.get("format") != TOKENIZED_CHUNK_MANIFEST_FORMAT:
@@ -104,12 +105,30 @@ class TokenizedManifestDataset(IterableDataset):
 
             yield chunk_path
 
+    def iter_worker_chunk_paths(self) -> Iterator[Path]:
+        """Yield only this DataLoader worker's chunk subset.
+
+        IterableDataset instances are copied into each worker process. Without
+        explicit sharding every worker would read every chunk, duplicating
+        training samples. Chunk-level sharding keeps memory bounded and avoids
+        repeated training examples when num_workers > 0.
+        """
+
+        worker_info = get_worker_info()
+        if worker_info is None:
+            yield from self.iter_chunk_paths()
+            return
+
+        for index, chunk_path in enumerate(self.iter_chunk_paths()):
+            if index % worker_info.num_workers == worker_info.id:
+                yield chunk_path
+
     def __iter__(self) -> Iterator[Mapping[str, Any]]:
         """Stream one sample at a time from chunk tensors."""
 
         emitted_sessions = 0
 
-        for chunk_path in self.iter_chunk_paths():
+        for chunk_path in self.iter_worker_chunk_paths():
             chunk = self._load_chunk(chunk_path)
             input_ids = chunk["input_ids"]
             attention_mask = chunk["attention_mask"]
@@ -151,7 +170,7 @@ class TokenizedManifestDataset(IterableDataset):
 
         chunk = self._load_torch_artifact(chunk_path)
 
-        if not isinstance(chunk, dict):
+        if not isinstance(chunk, Mapping):
             raise ValueError(f"Tokenized chunk must be a mapping: {chunk_path}")
 
         if chunk.get("format") != TOKENIZED_CHUNK_FORMAT:
