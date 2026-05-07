@@ -2,7 +2,10 @@
 
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
+
 import torch
+
+
 @dataclass(frozen=True)
 class MLMMaskingConfig:
     """Masking defaults for the verified ARGUS tokenized artifact."""
@@ -63,13 +66,14 @@ class ArgusMLMCollator:
         replace_with_random = (
             random_token_scores < 0.5
         ) & selected_for_mlm & ~replace_with_mask
-        random_token = torch.randint(
+        random_tokens = torch.randint(
             low=0,
             high=self.config.vocab_size,
             size=input_ids.shape,
             device=input_ids.device,
+            dtype=input_ids.dtype,
         )
-        masked_input_ids[replace_with_random] = random_token[replace_with_random]
+        masked_input_ids[replace_with_random] = random_tokens[replace_with_random]
 
         return {
             "input_ids": masked_input_ids,
