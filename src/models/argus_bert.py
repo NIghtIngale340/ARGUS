@@ -7,6 +7,7 @@ from transformers import BertConfig, BertForMaskedLM
 
 from src.models.config import ArgusBertConfig
 
+
 class ArgusBertForMaskedLM(nn.Module):
     """ARGUS-BERT model for masked log modeling."""
 
@@ -36,6 +37,10 @@ class ArgusBertForMaskedLM(nn.Module):
         attention_mask: Any | None = None,
         labels: Any | None = None,
     ) -> Any:
+        input_ids = input_ids.long()
+        if labels is not None:
+            labels = labels.long()
+
         return self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
