@@ -161,6 +161,7 @@ def main(args: Namespace | None = None) -> None:
             else None
         ),
     }
+    copied_files["metadata"] = "model_metadata.json"
 
     metadata = build_metadata(
         copied_files=copied_files,
@@ -172,7 +173,6 @@ def main(args: Namespace | None = None) -> None:
     )
     metadata_path = out_dir / "model_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    copied_files["metadata"] = metadata_path.name
 
     print(f"Bundle directory: {out_dir}")
     for label, filename in copied_files.items():
