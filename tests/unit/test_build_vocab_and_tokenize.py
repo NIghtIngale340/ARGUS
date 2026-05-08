@@ -210,7 +210,12 @@ def test_existing_vocab_can_be_reused_for_validation_split(tmp_path: Path) -> No
     assert "val-event_Kerberos_Network" not in vocab
 
     val_artifact = _load_torch_artifact(tmp_path / "data" / "tokenized" / "sessions_val.pt")
-    val_input_ids = val_artifact[0]["input_ids"].tolist()
+    assert val_artifact["format"] == "tokenized_session_chunk_manifest_v1"
+    assert val_artifact["session_count"] == 1
+    first_chunk = _load_torch_artifact(
+        tmp_path / "data" / "tokenized" / val_artifact["chunks"][0]
+    )
+    val_input_ids = first_chunk["input_ids"][0].tolist()
 
     assert val_input_ids[:3] == [vocab["[CLS]"], vocab["[UNK]"], vocab["[SEP]"]]
 

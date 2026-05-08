@@ -307,35 +307,20 @@ class LogTokenizer:
             if len(pending_session_ids) >= chunk_size:
                 flush_chunk(len(chunk_paths))
 
-        if chunk_paths:
-            if pending_session_ids:
-                flush_chunk(len(chunk_paths))
+        # Flush any remaining sessions as a final chunk
+        if pending_session_ids:
+            flush_chunk(len(chunk_paths))
 
-            manifest = {
-                "format": TOKENIZED_CHUNK_MANIFEST_FORMAT,
-                "chunks": chunk_paths,
-                "chunk_count": len(chunk_paths),
-                "session_count": session_count,
-                "max_len": self.max_len,
-                "unknown_events": unknown_events,
-                "total_events": total_events,
-            }
-            torch.save(manifest, output)
-        else:
-            serialized = []
-            for session_id, input_ids, attention_mask in zip(
-                pending_session_ids,
-                pending_input_ids,
-                pending_attention_masks,
-            ):
-                serialized.append(
-                    {
-                        "session_id": session_id,
-                        "input_ids": torch.tensor(input_ids, dtype=token_id_dtype),
-                        "attention_mask": torch.tensor(attention_mask, dtype=attention_mask_dtype),
-                    }
-                )
-            torch.save(serialized, output)
+        manifest = {
+            "format": TOKENIZED_CHUNK_MANIFEST_FORMAT,
+            "chunks": chunk_paths,
+            "chunk_count": len(chunk_paths),
+            "session_count": session_count,
+            "max_len": self.max_len,
+            "unknown_events": unknown_events,
+            "total_events": total_events,
+        }
+        torch.save(manifest, output)
 
         return TokenizedSaveStats(
             path=output,
