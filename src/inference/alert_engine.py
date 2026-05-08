@@ -235,6 +235,10 @@ class AlertEngine:
             "avg_user_risk": np.mean(list(self.risk_store.get_all_risks().values())) if self.risk_store.get_all_risks() else 0.0,
         }
 
+    def summary(self) -> dict:
+        """Backward-compatible alias for older notebook cells."""
+        return self.get_stats()
+
 
 def save_alerts_to_csv(alerts: list[Alert], output_path: str) -> None:
     """Save alerts to CSV."""

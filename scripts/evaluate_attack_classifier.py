@@ -321,7 +321,7 @@ def run_alert_engine(
             level: sum(1 for a in alerts if a.alert_class == level)
             for level in ("CRITICAL", "HIGH", "MEDIUM", "LOW")
         },
-        "engine_summary": engine.summary(),
+        "engine_summary": engine.get_stats(),
     }
 
 
