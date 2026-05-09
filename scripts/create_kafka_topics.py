@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
-"""
-ARGUS — Kafka Topic Provisioning
+"""Create ARGUS Kafka topics with explicit retention policies.
 
-Creates ARGUS topics with explicit partition counts and retention policies.
 Idempotent: existing topics are skipped without error.
-
-Requires: confluent-kafka (poetry add confluent-kafka)
+Requires: confluent-kafka.
 """
 
+from __future__ import annotations
+
+import os
 import sys
 
-try:
-    from src.config import settings
-except Exception as e:
-    print(f"[FATAL] Configuration load failed: {e}")
-    sys.exit(1)
+
+DEFAULT_KAFKA_BOOTSTRAP = "localhost:29092"
 
 
 TOPIC_SPECS = [
+    {
+        "name": "argus.raw-logs",
+        "partitions": 6,
+        "replication_factor": 1,
+        "config": {
+            "retention.ms": "259200000",  # 3 days
+        },
+    },
+    {
+        "name": "argus.detections",
+        "partitions": 3,
+        "replication_factor": 1,
+        "config": {
+            "retention.ms": "604800000",  # 7 days
+        },
+    },
     {
         "name": "logs.raw",
         "partitions": 6,
@@ -53,11 +66,22 @@ TOPIC_SPECS = [
 ]
 
 
-def create_topics():
+def create_topics(bootstrap: str | None = None) -> None:
     """Create all topics defined in TOPIC_SPECS via the Kafka AdminClient."""
-    from confluent_kafka.admin import AdminClient, NewTopic
+    try:
+        from confluent_kafka.admin import AdminClient, NewTopic
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "Install confluent-kafka to create topics "
+            "(for example: pip install confluent-kafka)."
+        ) from exc
 
-    admin = AdminClient({"bootstrap.servers": settings.kafka_bootstrap})
+    admin = AdminClient(
+        {
+            "bootstrap.servers": bootstrap
+            or os.getenv("KAFKA_BOOTSTRAP", DEFAULT_KAFKA_BOOTSTRAP)
+        }
+    )
 
     new_topics = [
         NewTopic(
@@ -75,20 +99,20 @@ def create_topics():
             try:
                 future.result()
                 print(f"  [OK] Created topic: {topic_name}")
-            except Exception as e:
-                if "TOPIC_ALREADY_EXISTS" in str(e):
+            except Exception as exc:
+                if "TOPIC_ALREADY_EXISTS" in str(exc):
                     print(f"  [SKIP] Topic already exists: {topic_name}")
                 else:
-                    print(f"  [FAIL] {topic_name}: {e}")
+                    print(f"  [FAIL] {topic_name}: {exc}")
                     raise
-    except Exception as e:
-        print(f"[FATAL] Failed to create topics: {e}")
+    except Exception as exc:
+        print(f"[FATAL] Failed to create topics: {exc}")
         sys.exit(1)
 
 
-def main():
+def main() -> None:
     print("=" * 60)
-    print("  ARGUS — Kafka Topic Provisioning")
+    print("  ARGUS Kafka Topic Provisioning")
     print("=" * 60)
     print()
 

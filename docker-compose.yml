@@ -61,8 +61,10 @@ services:
     environment:
       KAFKA_BROKER_ID: "1"
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
@@ -73,6 +75,7 @@ services:
       - kafka_data:/var/lib/kafka/data
     ports:
       - "9092:9092"
+      - "29092:29092"
     networks:
       - argus-net
     healthcheck:
@@ -143,11 +146,20 @@ services:
       dockerfile: docker/Dockerfile.api
     environment:
       ES_URL: http://elasticsearch:9200
+      ELASTICSEARCH_URL: http://elasticsearch:9200
       KAFKA_BOOTSTRAP: kafka:9092
       REDIS_URL: redis://redis:6379/0
       MLFLOW_URI: http://mlflow:5000
+      ARGUS_PHASE3_BUNDLE_DIR: /app/data/argus_phase3_model_bundle
+      ARGUS_PHASE3_THRESHOLD: ${ARGUS_PHASE3_THRESHOLD:-}
+      ARGUS_STREAM_SESSION_MAX_TOKENS: ${ARGUS_STREAM_SESSION_MAX_TOKENS:-}
+      ARGUS_USE_REDIS_UEBA: "true"
+      ARGUS_USE_ELASTICSEARCH_ALERTS: "true"
+      ARGUS_ALERT_INDEX_PREFIX: argus-alerts
       LOG_LEVEL: INFO
       ENV: development
+    volumes:
+      - ./data/argus_phase3_model_bundle:/app/data/argus_phase3_model_bundle:ro
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -177,15 +189,28 @@ services:
       REDIS_URL: redis://redis:6379/0
       MLFLOW_URI: http://mlflow:5000
       ES_URL: http://elasticsearch:9200
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      ARGUS_PHASE3_BUNDLE_DIR: /app/data/argus_phase3_model_bundle
+      ARGUS_PHASE3_THRESHOLD: ${ARGUS_PHASE3_THRESHOLD:-}
+      ARGUS_STREAM_SESSION_MAX_TOKENS: ${ARGUS_STREAM_SESSION_MAX_TOKENS:-}
+      ARGUS_USE_REDIS_UEBA: "true"
+      ARGUS_USE_ELASTICSEARCH_ALERTS: "true"
+      ARGUS_ALERT_INDEX_PREFIX: argus-alerts
+      ARGUS_RAW_LOG_TOPIC: argus.raw-logs
+      ARGUS_DETECTIONS_TOPIC: argus.detections
+    volumes:
+      - ./data/argus_phase3_model_bundle:/app/data/argus_phase3_model_bundle:ro
     depends_on:
       kafka:
         condition: service_healthy
       redis:
         condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
     networks:
       - argus-net
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import subprocess, sys; out = subprocess.check_output(['ps', '-ef'], text=True); sys.exit(0 if 'faust' in out else 1)\""]
+      test: ["CMD-SHELL", "/usr/local/bin/python -c \"from pathlib import Path; import sys; cmd = Path('/proc/1/cmdline').read_text(errors='ignore'); sys.exit(0 if 'scripts.run_phase4_streaming_consumer' in cmd else 1)\""]
       interval: 15s
       timeout: 5s
       retries: 20

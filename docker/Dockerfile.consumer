@@ -1,6 +1,6 @@
 FROM python:3.11-slim AS builder
 
-ENV POETRY_VERSION=1.8.3 \
+ENV POETRY_VERSION=2.3.2 \
     POETRY_HOME=/opt/poetry \
     POETRY_VIRTUALENVS_CREATE=false \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -13,21 +13,24 @@ RUN python -m venv /opt/venv && pip install --no-cache-dir --upgrade pip && pip 
 WORKDIR /app
 
 COPY pyproject.toml poetry.lock ./
-RUN poetry install --only main --no-interaction --no-ansi
+RUN poetry lock --no-interaction --no-ansi && poetry install --only main --no-interaction --no-ansi
 
 COPY src ./src
+COPY scripts ./scripts
 COPY configs ./configs
 
 FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/usr/local/bin:/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
+COPY --from=builder /usr/local /usr/local
 COPY --from=builder /app/src ./src
+COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/configs ./configs
 
-CMD ["faust", "-A", "src.inference.kafka_consumer", "worker", "-l", "info"]
+CMD ["/usr/local/bin/python", "-m", "scripts.run_phase4_streaming_consumer"]

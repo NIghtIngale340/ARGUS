@@ -7,8 +7,11 @@ import torch
 
 from src.inference.kafka_consumer import (
     StreamingSessionProcessor,
+    create_alert_store_from_env,
+    create_streaming_processor_from_env,
     extract_user_host,
 )
+import src.inference.kafka_consumer as kafka_consumer
 from src.inference.session_tracker import SessionTracker
 
 
@@ -206,3 +209,69 @@ def test_detection_tensors_are_torch_tensors() -> None:
     assert isinstance(item["attention_mask"], torch.Tensor)
     assert item["input_ids"].dtype == torch.long
     assert item["attention_mask"].dtype == torch.bool
+
+
+def test_create_alert_store_from_env_is_optional(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ARGUS_USE_ELASTICSEARCH_ALERTS", raising=False)
+
+    assert create_alert_store_from_env() is None
+
+
+def test_create_alert_store_from_env_uses_es_url_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created: dict[str, object] = {}
+
+    class FakeAlertStore:
+        def __init__(self, elasticsearch_url: str, *, index_prefix: str) -> None:
+            created["elasticsearch_url"] = elasticsearch_url
+            created["index_prefix"] = index_prefix
+
+    monkeypatch.setattr(kafka_consumer, "ElasticsearchAlertStore", FakeAlertStore)
+    monkeypatch.setenv("ARGUS_USE_ELASTICSEARCH_ALERTS", "true")
+    monkeypatch.delenv("ELASTICSEARCH_URL", raising=False)
+    monkeypatch.setenv("ES_URL", "http://localhost:9200")
+    monkeypatch.setenv("ARGUS_ALERT_INDEX_PREFIX", "argus-test-alerts")
+
+    store = create_alert_store_from_env()
+
+    assert isinstance(store, FakeAlertStore)
+    assert created == {
+        "elasticsearch_url": "http://localhost:9200",
+        "index_prefix": "argus-test-alerts",
+    }
+
+
+def test_create_streaming_processor_from_env_passes_alert_store(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    captured: dict[str, object] = {}
+    fake_alert_store = object()
+
+    def fake_from_bundle_dir(bundle_dir, **kwargs):
+        captured["bundle_dir"] = bundle_dir
+        captured.update(kwargs)
+        return FakeDetector()
+
+    monkeypatch.setenv("ARGUS_PHASE3_BUNDLE_DIR", str(tmp_path))
+    monkeypatch.setenv("REDIS_URL", "redis://localhost:6379/0")
+    monkeypatch.setenv("ARGUS_STREAM_SESSION_MAX_TOKENS", "2")
+    monkeypatch.setenv("ARGUS_PHASE3_THRESHOLD", "0.1")
+    monkeypatch.setattr(
+        kafka_consumer.Phase3DetectionService,
+        "from_bundle_dir",
+        staticmethod(fake_from_bundle_dir),
+    )
+    monkeypatch.setattr(
+        kafka_consumer,
+        "create_alert_store_from_env",
+        lambda: fake_alert_store,
+    )
+
+    processor = create_streaming_processor_from_env()
+
+    assert isinstance(processor, StreamingSessionProcessor)
+    assert captured["alert_store"] is fake_alert_store
+    assert captured["redis_url"] == "redis://localhost:6379/0"
+    assert captured["threshold"] == 0.1

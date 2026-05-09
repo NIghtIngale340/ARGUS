@@ -19,6 +19,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return float(raw)
+
+
 class SessionRequest(BaseModel):
     session_id: str | int | None = None
     user_id: str = ""
@@ -47,6 +54,7 @@ def create_app(bundle_dir: str | None = None) -> FastAPI:
     if configured_bundle:
         app.state.phase3_detector = Phase3DetectionService.from_bundle_dir(
             configured_bundle,
+            threshold=_env_optional_float("ARGUS_PHASE3_THRESHOLD"),
             redis_url=redis_url,
             redis_key_prefix=redis_key_prefix,
             alert_store=alert_store,

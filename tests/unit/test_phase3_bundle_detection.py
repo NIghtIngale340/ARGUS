@@ -236,6 +236,18 @@ def test_phase3_api_detects_sessions_from_configured_bundle(tmp_path: Path) -> N
     assert payload["detections"][0]["prediction"] == "attack"
 
 
+def test_phase3_api_accepts_env_threshold_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle_dir = _package_bundle(tmp_path)
+    monkeypatch.setenv("ARGUS_PHASE3_THRESHOLD", "0.123")
+
+    app = create_app(bundle_dir=str(bundle_dir))
+
+    assert app.state.phase3_detector.threshold == pytest.approx(0.123)
+
+
 def test_phase3_api_exposes_and_clears_ueba_risks(tmp_path: Path) -> None:
     fastapi = pytest.importorskip("fastapi.testclient")
     bundle_dir = _package_bundle(tmp_path)

@@ -12,6 +12,7 @@ torch = "^2.1.0"
 transformers = "^4.37.0"
 drain3 = "^0.9.11"
 faust-streaming = "^0.10.0"
+confluent-kafka = "^2.4.0"
 elasticsearch = "^8.11.0"
 redis = { extras = ["hiredis"], version = "^5.0.0" }
 fastapi = "^0.109.0"

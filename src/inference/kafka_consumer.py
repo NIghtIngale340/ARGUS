@@ -8,12 +8,13 @@ from typing import Any, Iterable, Mapping
 
 import torch
 
+from src.inference.alert_store import ElasticsearchAlertStore
 from src.inference.phase3_detection import Phase3DetectionService
 from src.inference.session_tracker import SessionTracker
 
 try:
     from faust import App
-except ModuleNotFoundError:
+except Exception:
     App = None  # type: ignore[assignment]
 
 
@@ -178,6 +179,28 @@ def _env_optional_int(name: str) -> int | None:
     return int(raw)
 
 
+def _env_optional_float(name: str) -> float | None:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return float(raw)
+
+
+def create_alert_store_from_env() -> ElasticsearchAlertStore | None:
+    """Create optional Elasticsearch alert persistence from env vars."""
+    if not _env_bool("ARGUS_USE_ELASTICSEARCH_ALERTS", False):
+        return None
+    elasticsearch_url = (
+        os.getenv("ELASTICSEARCH_URL")
+        or os.getenv("ES_URL")
+        or "http://elasticsearch:9200"
+    )
+    return ElasticsearchAlertStore(
+        elasticsearch_url,
+        index_prefix=os.getenv("ARGUS_ALERT_INDEX_PREFIX", "argus-alerts"),
+    )
+
+
 def create_streaming_processor_from_env() -> StreamingSessionProcessor:
     """Create the Redis session tracker and Phase 3 detector from env vars."""
     bundle_dir = os.getenv("ARGUS_PHASE3_BUNDLE_DIR")
@@ -185,10 +208,13 @@ def create_streaming_processor_from_env() -> StreamingSessionProcessor:
         raise RuntimeError("ARGUS_PHASE3_BUNDLE_DIR is required for Kafka detection")
 
     redis_url = os.getenv("REDIS_URL", "redis://redis:6379/0")
+    alert_store = create_alert_store_from_env()
     detector = Phase3DetectionService.from_bundle_dir(
         Path(bundle_dir),
+        threshold=_env_optional_float("ARGUS_PHASE3_THRESHOLD"),
         redis_url=redis_url if _env_bool("ARGUS_USE_REDIS_UEBA", True) else None,
         redis_key_prefix=os.getenv("ARGUS_UEBA_REDIS_PREFIX", "argus:ueba"),
+        alert_store=alert_store,
     )
     max_events = _env_optional_int("ARGUS_STREAM_SESSION_MAX_TOKENS")
     if max_events is None:
@@ -266,6 +292,7 @@ __all__ = [
     "StreamingSessionProcessor",
     "app",
     "consume",
+    "create_alert_store_from_env",
     "create_streaming_processor_from_env",
     "extract_user_host",
     "get_streaming_processor",

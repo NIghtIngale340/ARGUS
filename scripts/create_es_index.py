@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
+import os
 import sys
 
-try:
-    from src.config import settings
-except Exception as e:
-    print(f"[FATAL] Configuration load failed: {e}")
-    sys.exit(1)
+DEFAULT_ES_URL = "http://localhost:9200"
 
 
 INDEX_TEMPLATES = {
@@ -123,7 +120,8 @@ def create_index_templates():
     try:
         from elasticsearch import Elasticsearch
 
-        es = Elasticsearch(settings.es_url)
+        es_url = os.getenv("ELASTICSEARCH_URL") or os.getenv("ES_URL") or DEFAULT_ES_URL
+        es = Elasticsearch(es_url)
 
         count = 0
         for template_name, template_body in INDEX_TEMPLATES.items():
