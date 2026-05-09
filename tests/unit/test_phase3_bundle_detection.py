@@ -234,3 +234,57 @@ def test_phase3_api_detects_sessions_from_configured_bundle(tmp_path: Path) -> N
     assert payload["threshold"] == 0.0
     assert payload["detections"][0]["session_id"] == "api_s1"
     assert payload["detections"][0]["prediction"] == "attack"
+
+
+def test_phase3_api_exposes_and_clears_ueba_risks(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi.testclient")
+    bundle_dir = _package_bundle(tmp_path)
+    app = create_app(bundle_dir=str(bundle_dir))
+    client = fastapi.TestClient(app)
+
+    detection = client.post(
+        "/phase3/detect",
+        json={
+            "threshold": 0.0,
+            "sessions": [
+                {
+                    "session_id": "risk_s1",
+                    "user_id": "risk_user",
+                    "host_id": "risk_host",
+                    "events": [
+                        {
+                            "event_id": "NA",
+                            "auth_type": "NTLM",
+                            "logon_type": "Network",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert detection.status_code == 200
+
+    all_risks = client.get("/phase3/ueba/risks")
+    assert all_risks.status_code == 200
+    all_payload = all_risks.json()
+    assert all_payload["count"] == 1
+    assert "risk_user" in all_payload["risks"]
+    assert all_payload["risks"]["risk_user"] > 0.0
+
+    user_risk = client.get("/phase3/ueba/risks/risk_user")
+    assert user_risk.status_code == 200
+    user_payload = user_risk.json()
+    assert user_payload["exists"] is True
+    assert user_payload["risk"] == pytest.approx(all_payload["risks"]["risk_user"])
+
+    missing_risk = client.get("/phase3/ueba/risks/missing_user")
+    assert missing_risk.status_code == 200
+    assert missing_risk.json()["exists"] is False
+
+    cleared = client.delete("/phase3/ueba/risks")
+    assert cleared.status_code == 200
+    assert cleared.json()["cleared"] == 1
+    assert cleared.json()["remaining"] == 0
+
+    after_clear = client.get("/phase3/ueba/risks")
+    assert after_clear.json()["risks"] == {}

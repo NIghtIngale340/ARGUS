@@ -83,6 +83,47 @@ def create_app(bundle_dir: str | None = None) -> FastAPI:
             "detections": rows,
         }
 
+    def _require_detector() -> Phase3DetectionService:
+        detector: Phase3DetectionService | None = app.state.phase3_detector
+        if detector is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Phase 3 detector is not configured. Set ARGUS_PHASE3_BUNDLE_DIR.",
+            )
+        return detector
+
+    @app.get("/phase3/ueba/risks")
+    def list_ueba_risks() -> dict[str, Any]:
+        detector = _require_detector()
+        risks = detector.alert_engine.risk_store.get_all_risks()
+        return {
+            "count": len(risks),
+            "redis_ueba_enabled": app.state.redis_ueba_enabled,
+            "risks": risks,
+        }
+
+    @app.get("/phase3/ueba/risks/{user_id}")
+    def get_ueba_risk(user_id: str) -> dict[str, Any]:
+        detector = _require_detector()
+        risks = detector.alert_engine.risk_store.get_all_risks()
+        return {
+            "user_id": user_id,
+            "risk": detector.alert_engine.risk_store.get_risk(user_id),
+            "exists": user_id in risks,
+            "redis_ueba_enabled": app.state.redis_ueba_enabled,
+        }
+
+    @app.delete("/phase3/ueba/risks")
+    def clear_ueba_risks() -> dict[str, Any]:
+        detector = _require_detector()
+        before = len(detector.alert_engine.risk_store.get_all_risks())
+        detector.alert_engine.risk_store.clear()
+        return {
+            "cleared": before,
+            "remaining": len(detector.alert_engine.risk_store.get_all_risks()),
+            "redis_ueba_enabled": app.state.redis_ueba_enabled,
+        }
+
     return app
 
 

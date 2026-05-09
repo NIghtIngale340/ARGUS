@@ -85,6 +85,9 @@ class RiskStore(Protocol):
     def get_all_risks(self) -> dict[str, float]:
         ...
 
+    def clear(self) -> None:
+        ...
+
 
 def normalize_anomaly_score(anomaly_score: float, ceiling: float = 15.0) -> float:
     """Normalize an unbounded anomaly score into [0, 1]."""
@@ -136,6 +139,11 @@ class UEBARiskStore:
     def get_all_risks(self) -> dict[str, float]:
         """Return all user risk scores."""
         return dict(self._store)
+
+    def clear(self) -> None:
+        """Delete all in-memory UEBA risk state."""
+        self._store.clear()
+        self._last_update.clear()
 
 
 class RedisUEBARiskStore:
