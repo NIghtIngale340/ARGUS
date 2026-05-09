@@ -49,6 +49,8 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--technique-id", default="T1078")
     parser.add_argument("--anomaly-ceiling", type=float, default=15.0)
     parser.add_argument("--dedup-window-secs", type=float, default=0.0)
+    parser.add_argument("--redis-url", help="Use Redis-backed UEBA risk state")
+    parser.add_argument("--redis-key-prefix", default="argus:ueba")
     return parser
 
 
@@ -74,6 +76,8 @@ def main(args: Namespace | None = None) -> None:
         anomaly_ceiling=parsed.anomaly_ceiling,
         dedup_window_secs=parsed.dedup_window_secs,
         technique_id=parsed.technique_id,
+        redis_url=getattr(parsed, "redis_url", None),
+        redis_key_prefix=getattr(parsed, "redis_key_prefix", "argus:ueba"),
     )
 
     if parsed.sessions_jsonl:

@@ -11,9 +11,11 @@ Into a single composite severity score for alert prioritization.
 
 import json
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Protocol
+
+import numpy as np
 
 
 @dataclass
@@ -71,6 +73,26 @@ def load_technique_severity(path: Optional[str] = None) -> dict[str, float]:
     return DEFAULT_TECHNIQUE_SEVERITY.copy()
 
 
+class RiskStore(Protocol):
+    """Storage interface for per-user UEBA risk."""
+
+    def get_risk(self, user_id: str) -> float:
+        ...
+
+    def update_risk(self, user_id: str, anomaly_score: float) -> float:
+        ...
+
+    def get_all_risks(self) -> dict[str, float]:
+        ...
+
+
+def normalize_anomaly_score(anomaly_score: float, ceiling: float = 15.0) -> float:
+    """Normalize an unbounded anomaly score into [0, 1]."""
+    if ceiling <= 0:
+        raise ValueError("ceiling must be positive")
+    return min(max(float(anomaly_score) / ceiling, 0.0), 1.0)
+
+
 class UEBARiskStore:
     """Per-user risk tracking using Exponentially Weighted Moving Average.
 
@@ -105,7 +127,7 @@ class UEBARiskStore:
             Updated risk score.
         """
         old_risk = self._store.get(user_id, self.default_risk)
-        normalized = min(anomaly_score / 15.0, 1.0)
+        normalized = normalize_anomaly_score(anomaly_score)
         new_risk = old_risk * self.decay + normalized * (1.0 - self.decay)
         self._store[user_id] = new_risk
         self._last_update[user_id] = time.time()
@@ -114,6 +136,83 @@ class UEBARiskStore:
     def get_all_risks(self) -> dict[str, float]:
         """Return all user risk scores."""
         return dict(self._store)
+
+
+class RedisUEBARiskStore:
+    """Redis-backed per-user UEBA risk tracking.
+
+    Stores the same EWMA risk values as ``UEBARiskStore`` but persists them in
+    Redis hashes so API and worker processes can share user risk state.
+    """
+
+    def __init__(
+        self,
+        redis_url: str | None = None,
+        *,
+        client: Any | None = None,
+        decay: float = 0.95,
+        default_risk: float = 0.0,
+        key_prefix: str = "argus:ueba",
+        socket_timeout: float = 2.0,
+    ) -> None:
+        if not 0.0 <= decay <= 1.0:
+            raise ValueError("decay must be in [0, 1]")
+        self.decay = decay
+        self.default_risk = default_risk
+        self.key_prefix = key_prefix.rstrip(":")
+        self.risk_key = f"{self.key_prefix}:risk"
+        self.last_update_key = f"{self.key_prefix}:last_update"
+
+        if client is None:
+            if not redis_url:
+                raise ValueError("redis_url is required when client is not provided")
+            try:
+                import redis
+            except ModuleNotFoundError as exc:
+                raise RuntimeError("Install redis to use RedisUEBARiskStore") from exc
+            client = redis.Redis.from_url(
+                redis_url,
+                decode_responses=True,
+                socket_timeout=socket_timeout,
+                socket_connect_timeout=socket_timeout,
+            )
+        self.client = client
+
+    def ping(self) -> bool:
+        """Return True when Redis responds to PING."""
+        return bool(self.client.ping())
+
+    def get_risk(self, user_id: str) -> float:
+        stored = self.client.hget(self.risk_key, str(user_id))
+        if stored is None:
+            return self.default_risk
+        try:
+            return float(stored)
+        except (TypeError, ValueError):
+            return self.default_risk
+
+    def update_risk(self, user_id: str, anomaly_score: float) -> float:
+        old_risk = self.get_risk(user_id)
+        normalized = normalize_anomaly_score(anomaly_score)
+        new_risk = old_risk * self.decay + normalized * (1.0 - self.decay)
+        now = time.time()
+        self.client.hset(self.risk_key, str(user_id), repr(new_risk))
+        self.client.hset(self.last_update_key, str(user_id), repr(now))
+        return new_risk
+
+    def get_all_risks(self) -> dict[str, float]:
+        raw = self.client.hgetall(self.risk_key)
+        risks: dict[str, float] = {}
+        for user_id, value in raw.items():
+            try:
+                risks[str(user_id)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return risks
+
+    def clear(self) -> None:
+        """Delete stored UEBA risk state for tests or local resets."""
+        self.client.delete(self.risk_key, self.last_update_key)
 
 
 class AlertEngine:
@@ -143,7 +242,7 @@ class AlertEngine:
     def __init__(
         self,
         technique_severity_path: Optional[str] = None,
-        risk_store: Optional[UEBARiskStore] = None,
+        risk_store: Optional[RiskStore] = None,
         anomaly_ceiling: float = 15.0,
         dedup_window_secs: float = 300.0,
     ) -> None:
@@ -229,10 +328,11 @@ class AlertEngine:
 
     def get_stats(self) -> dict:
         """Return engine statistics."""
+        risks = self.risk_store.get_all_risks()
         return {
             "total_alerts_generated": self._alert_counter,
             "users_alerted": len(self._recent_alerts),
-            "avg_user_risk": np.mean(list(self.risk_store.get_all_risks().values())) if self.risk_store.get_all_risks() else 0.0,
+            "avg_user_risk": float(np.mean(list(risks.values()))) if risks else 0.0,
         }
 
     def summary(self) -> dict:
@@ -259,6 +359,3 @@ def save_alerts_to_csv(alerts: list[Alert], output_path: str) -> None:
             writer.writerow(alert.to_dict())
 
     print(f"Saved {len(alerts)} alerts → {output_path}")
-
-
-import numpy as np

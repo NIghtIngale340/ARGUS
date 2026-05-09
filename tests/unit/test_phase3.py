@@ -12,6 +12,7 @@ from src.models.config import ArgusBertConfig
 from src.inference.alert_engine import (
     Alert,
     AlertEngine,
+    RedisUEBARiskStore,
     ScoredSession,
     UEBARiskStore,
     load_technique_severity,
@@ -142,6 +143,60 @@ class TestUEBARiskStore:
         assert "u1" in all_risks
         assert "u2" in all_risks
         assert len(all_risks) == 2
+
+
+class FakeRedis:
+    def __init__(self) -> None:
+        self.hashes: dict[str, dict[str, str]] = {}
+
+    def ping(self) -> bool:
+        return True
+
+    def hget(self, key: str, field: str) -> str | None:
+        return self.hashes.get(key, {}).get(field)
+
+    def hset(self, key: str, field: str, value: str) -> None:
+        self.hashes.setdefault(key, {})[field] = str(value)
+
+    def hgetall(self, key: str) -> dict[str, str]:
+        return dict(self.hashes.get(key, {}))
+
+    def delete(self, *keys: str) -> None:
+        for key in keys:
+            self.hashes.pop(key, None)
+
+
+class TestRedisUEBARiskStore:
+    def test_risk_persists_across_store_instances(self) -> None:
+        client = FakeRedis()
+        store_a = RedisUEBARiskStore(client=client, decay=0.9)
+        first_risk = store_a.update_risk("user_a", 15.0)
+
+        store_b = RedisUEBARiskStore(client=client, decay=0.9)
+
+        assert first_risk > 0.0
+        assert store_b.get_risk("user_a") == pytest.approx(first_risk)
+
+    def test_get_all_risks_reads_redis_hash(self) -> None:
+        client = FakeRedis()
+        store = RedisUEBARiskStore(client=client, key_prefix="test:ueba")
+        store.update_risk("u1", 15.0)
+        store.update_risk("u2", 7.5)
+
+        risks = store.get_all_risks()
+
+        assert set(risks) == {"u1", "u2"}
+        assert risks["u1"] > risks["u2"]
+
+    def test_clear_deletes_risk_state(self) -> None:
+        client = FakeRedis()
+        store = RedisUEBARiskStore(client=client)
+        store.update_risk("u1", 15.0)
+
+        store.clear()
+
+        assert store.get_all_risks() == {}
+        assert store.get_risk("u1") == 0.0
 
 
 class TestAlertEngine:

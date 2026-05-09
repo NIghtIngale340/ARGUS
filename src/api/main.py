@@ -11,6 +11,13 @@ from pydantic import BaseModel, Field
 from src.inference.phase3_detection import Phase3DetectionService
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 class SessionRequest(BaseModel):
     session_id: str | int | None = None
     user_id: str = ""
@@ -27,15 +34,21 @@ class DetectionRequest(BaseModel):
 def create_app(bundle_dir: str | None = None) -> FastAPI:
     app = FastAPI(title="ARGUS API", version="0.1.0")
     configured_bundle = bundle_dir or os.getenv("ARGUS_PHASE3_BUNDLE_DIR")
+    redis_url = os.getenv("REDIS_URL") if _env_flag("ARGUS_USE_REDIS_UEBA") else None
+    redis_key_prefix = os.getenv("ARGUS_UEBA_REDIS_PREFIX", "argus:ueba")
 
     if configured_bundle:
         app.state.phase3_detector = Phase3DetectionService.from_bundle_dir(
-            configured_bundle
+            configured_bundle,
+            redis_url=redis_url,
+            redis_key_prefix=redis_key_prefix,
         )
         app.state.phase3_bundle_dir = configured_bundle
+        app.state.redis_ueba_enabled = redis_url is not None
     else:
         app.state.phase3_detector = None
         app.state.phase3_bundle_dir = None
+        app.state.redis_ueba_enabled = False
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -44,6 +57,7 @@ def create_app(bundle_dir: str | None = None) -> FastAPI:
             "service": "ARGUS API",
             "phase3_model_loaded": app.state.phase3_detector is not None,
             "phase3_bundle_dir": app.state.phase3_bundle_dir,
+            "redis_ueba_enabled": app.state.redis_ueba_enabled,
         }
 
     @app.post("/phase3/detect")

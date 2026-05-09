@@ -11,7 +11,12 @@ from typing import Any, Iterable, Iterator, Mapping
 import torch
 from torch.utils.data import DataLoader
 
-from src.inference.alert_engine import AlertEngine, ScoredSession
+from src.inference.alert_engine import (
+    AlertEngine,
+    RedisUEBARiskStore,
+    RiskStore,
+    ScoredSession,
+)
 from src.models.attack_classifier import ARGUSClassifier
 from src.models.config import ArgusBertConfig
 from src.parsing.log_tokenizer import LogTokenizer
@@ -220,6 +225,9 @@ class Phase3DetectionService:
         anomaly_ceiling: float = 15.0,
         dedup_window_secs: float = 0.0,
         technique_id: str = "T1078",
+        risk_store: RiskStore | None = None,
+        redis_url: str | None = None,
+        redis_key_prefix: str = "argus:ueba",
     ) -> None:
         require_existing(paths)
         self.paths = paths
@@ -235,7 +243,13 @@ class Phase3DetectionService:
         self.technique_id = technique_id
         self.model = load_classifier(paths.classifier, self.device)
         self.tokenizer = LogTokenizer(paths.vocab, max_len=self.max_seq_len)
+        if risk_store is None and redis_url:
+            risk_store = RedisUEBARiskStore(
+                redis_url,
+                key_prefix=redis_key_prefix,
+            )
         self.alert_engine = AlertEngine(
+            risk_store=risk_store,
             anomaly_ceiling=anomaly_ceiling,
             dedup_window_secs=dedup_window_secs,
         )
