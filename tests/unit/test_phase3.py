@@ -148,6 +148,8 @@ class TestUEBARiskStore:
 class FakeRedis:
     def __init__(self) -> None:
         self.hashes: dict[str, dict[str, str]] = {}
+        self.sorted_sets: dict[str, dict[str, float]] = {}
+        self.expirations: dict[str, int] = {}
 
     def ping(self) -> bool:
         return True
@@ -164,6 +166,28 @@ class FakeRedis:
     def delete(self, *keys: str) -> None:
         for key in keys:
             self.hashes.pop(key, None)
+            self.sorted_sets.pop(key, None)
+            self.expirations.pop(key, None)
+
+    def zadd(self, key: str, mapping: dict[str, float]) -> int:
+        target = self.sorted_sets.setdefault(key, {})
+        before = len(target)
+        target.update({str(member): float(score) for member, score in mapping.items()})
+        return len(target) - before
+
+    def zrangebyscore(self, key: str, min_score: float, max_score: float) -> list[str]:
+        return [
+            member
+            for member, score in sorted(
+                self.sorted_sets.get(key, {}).items(),
+                key=lambda item: item[1],
+            )
+            if float(min_score) <= score <= float(max_score)
+        ]
+
+    def expire(self, key: str, ttl_seconds: int) -> bool:
+        self.expirations[key] = int(ttl_seconds)
+        return True
 
 
 class TestRedisUEBARiskStore:
@@ -197,6 +221,18 @@ class TestRedisUEBARiskStore:
 
         assert store.get_all_risks() == {}
         assert store.get_risk("u1") == 0.0
+
+    def test_get_risk_timeline_reads_recent_redis_events(self) -> None:
+        client = FakeRedis()
+        store = RedisUEBARiskStore(client=client)
+        now = 1_700_000_000.0
+        store.append_risk_event("u1", 0.2, timestamp=now - 40 * 24 * 60 * 60)
+        store.append_risk_event("u1", 0.8, timestamp=now - 60)
+
+        timeline = store.get_risk_timeline("u1", days=30, now=now)
+
+        assert len(timeline) == 1
+        assert timeline[0]["risk"] == 0.8
 
 
 class TestAlertEngine:

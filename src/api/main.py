@@ -8,6 +8,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
+from src.inference.alert_store import ElasticsearchAlertStore
 from src.inference.phase3_detection import Phase3DetectionService
 
 
@@ -36,19 +37,28 @@ def create_app(bundle_dir: str | None = None) -> FastAPI:
     configured_bundle = bundle_dir or os.getenv("ARGUS_PHASE3_BUNDLE_DIR")
     redis_url = os.getenv("REDIS_URL") if _env_flag("ARGUS_USE_REDIS_UEBA") else None
     redis_key_prefix = os.getenv("ARGUS_UEBA_REDIS_PREFIX", "argus:ueba")
+    alert_store = None
+    if _env_flag("ARGUS_USE_ELASTICSEARCH_ALERTS"):
+        alert_store = ElasticsearchAlertStore(
+            os.getenv("ELASTICSEARCH_URL", "http://localhost:9200"),
+            index_prefix=os.getenv("ARGUS_ALERT_INDEX_PREFIX", "argus-alerts"),
+        )
 
     if configured_bundle:
         app.state.phase3_detector = Phase3DetectionService.from_bundle_dir(
             configured_bundle,
             redis_url=redis_url,
             redis_key_prefix=redis_key_prefix,
+            alert_store=alert_store,
         )
         app.state.phase3_bundle_dir = configured_bundle
         app.state.redis_ueba_enabled = redis_url is not None
+        app.state.elasticsearch_alerts_enabled = alert_store is not None
     else:
         app.state.phase3_detector = None
         app.state.phase3_bundle_dir = None
         app.state.redis_ueba_enabled = False
+        app.state.elasticsearch_alerts_enabled = False
 
     @app.get("/health")
     def health() -> dict[str, Any]:
@@ -58,6 +68,7 @@ def create_app(bundle_dir: str | None = None) -> FastAPI:
             "phase3_model_loaded": app.state.phase3_detector is not None,
             "phase3_bundle_dir": app.state.phase3_bundle_dir,
             "redis_ueba_enabled": app.state.redis_ueba_enabled,
+            "elasticsearch_alerts_enabled": app.state.elasticsearch_alerts_enabled,
         }
 
     @app.post("/phase3/detect")
@@ -110,6 +121,23 @@ def create_app(bundle_dir: str | None = None) -> FastAPI:
             "user_id": user_id,
             "risk": detector.alert_engine.risk_store.get_risk(user_id),
             "exists": user_id in risks,
+            "redis_ueba_enabled": app.state.redis_ueba_enabled,
+        }
+
+    @app.get("/phase3/ueba/risks/{user_id}/timeline")
+    def get_ueba_risk_timeline(user_id: str, days: int = 30) -> dict[str, Any]:
+        detector = _require_detector()
+        if days <= 0:
+            raise HTTPException(status_code=400, detail="days must be positive")
+        timeline = detector.alert_engine.risk_store.get_risk_timeline(
+            user_id,
+            days=days,
+        )
+        return {
+            "user_id": user_id,
+            "days": days,
+            "count": len(timeline),
+            "timeline": timeline,
             "redis_ueba_enabled": app.state.redis_ueba_enabled,
         }
 

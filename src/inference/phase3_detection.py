@@ -17,6 +17,7 @@ from src.inference.alert_engine import (
     RiskStore,
     ScoredSession,
 )
+from src.inference.alert_store import AlertStore
 from src.models.attack_classifier import ARGUSClassifier
 from src.models.config import ArgusBertConfig
 from src.parsing.log_tokenizer import LogTokenizer
@@ -29,6 +30,8 @@ DETECTION_FIELDNAMES = [
     "host_id",
     "attack_probability",
     "prediction",
+    "technique_id",
+    "technique_probability",
     "threshold",
     "alert_generated",
     "alert_class",
@@ -138,15 +141,32 @@ def load_classifier(classifier_path: Path, device: torch.device) -> ARGUSClassif
     if not isinstance(config, ArgusBertConfig):
         config = ArgusBertConfig()
 
+    num_classes = int(checkpoint.get("num_classes", 2))
     model = ARGUSClassifier(
         config=config,
-        num_classes=int(checkpoint.get("num_classes", 2)),
+        num_classes=num_classes,
         freeze_layers=0,
     )
     state_dict = checkpoint.get("model_state_dict")
     if state_dict is None:
         raise ValueError(f"Classifier checkpoint missing model_state_dict: {classifier_path}")
     model.load_state_dict(state_dict)
+    class_names = checkpoint.get("class_names")
+    if isinstance(class_names, list) and len(class_names) == num_classes:
+        model.class_names = [str(class_name) for class_name in class_names]
+    elif num_classes == 2:
+        model.class_names = ["normal", "attack"]
+    else:
+        model.class_names = ["normal"] + [
+            f"class_{index}" for index in range(1, num_classes)
+        ]
+    label_to_id = checkpoint.get("label_to_id")
+    if isinstance(label_to_id, dict):
+        model.label_to_id = {str(key): int(value) for key, value in label_to_id.items()}
+    else:
+        model.label_to_id = {
+            class_name: index for index, class_name in enumerate(model.class_names)
+        }
     model.to(device)
     model.eval()
     return model
@@ -228,6 +248,7 @@ class Phase3DetectionService:
         risk_store: RiskStore | None = None,
         redis_url: str | None = None,
         redis_key_prefix: str = "argus:ueba",
+        alert_store: AlertStore | None = None,
     ) -> None:
         require_existing(paths)
         self.paths = paths
@@ -242,6 +263,14 @@ class Phase3DetectionService:
         self.anomaly_ceiling = anomaly_ceiling
         self.technique_id = technique_id
         self.model = load_classifier(paths.classifier, self.device)
+        self.class_names = list(getattr(self.model, "class_names", ["normal", "attack"]))
+        self.label_to_id = dict(
+            getattr(
+                self.model,
+                "label_to_id",
+                {class_name: index for index, class_name in enumerate(self.class_names)},
+            )
+        )
         self.tokenizer = LogTokenizer(paths.vocab, max_len=self.max_seq_len)
         if risk_store is None and redis_url:
             risk_store = RedisUEBARiskStore(
@@ -253,6 +282,7 @@ class Phase3DetectionService:
             anomaly_ceiling=anomaly_ceiling,
             dedup_window_secs=dedup_window_secs,
         )
+        self.alert_store = alert_store
 
     @classmethod
     def from_bundle_dir(
@@ -331,37 +361,94 @@ class Phase3DetectionService:
 
         with torch.inference_mode():
             logits = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            attack_probs = torch.softmax(logits, dim=-1)[:, 1].detach().cpu().tolist()
+            probability_rows = torch.softmax(logits, dim=-1).detach().cpu().tolist()
 
         rows = []
         active_technique = technique_id or self.technique_id
-        for item, attack_probability in zip(batch, attack_probs):
-            prediction = "attack" if attack_probability >= active_threshold else "normal"
-            confidence = attack_probability if prediction == "attack" else 0.95
+        for item, probabilities in zip(batch, probability_rows):
+            class_decision = self._classify_probabilities(
+                probabilities,
+                threshold=active_threshold,
+                fallback_technique_id=active_technique,
+            )
             scored = ScoredSession(
                 session_id=str(item["session_id"]),
                 user_id=str(item.get("user_id", "")),
                 host_id=str(item.get("host_id", "")),
-                anomaly_score=float(attack_probability) * self.anomaly_ceiling,
-                classification=prediction,
-                classification_confidence=float(confidence),
-                technique_id=active_technique if prediction == "attack" else None,
+                anomaly_score=float(class_decision["attack_probability"]) * self.anomaly_ceiling,
+                classification=class_decision["prediction"],
+                classification_confidence=float(class_decision["classification_confidence"]),
+                technique_id=class_decision["technique_id"],
             )
             alert = self.alert_engine.process_session(scored)
-            rows.append(
-                {
-                    "session_id": scored.session_id,
-                    "user_id": scored.user_id,
-                    "host_id": scored.host_id,
-                    "attack_probability": float(attack_probability),
-                    "prediction": prediction,
-                    "threshold": active_threshold,
-                    "alert_generated": alert is not None,
-                    "alert_class": alert.alert_class if alert else "",
-                    "composite_severity": alert.composite_severity if alert else "",
-                }
-            )
+            row = {
+                "session_id": scored.session_id,
+                "user_id": scored.user_id,
+                "host_id": scored.host_id,
+                "attack_probability": float(class_decision["attack_probability"]),
+                "prediction": class_decision["prediction"],
+                "technique_id": class_decision["technique_id"] or "",
+                "technique_probability": float(class_decision["technique_probability"]),
+                "threshold": active_threshold,
+                "alert_generated": alert is not None,
+                "alert_class": alert.alert_class if alert else "",
+                "composite_severity": alert.composite_severity if alert else "",
+            }
+            if alert is not None and self.alert_store is not None:
+                self.alert_store.index_alert(
+                    alert,
+                    extra={
+                        "attack_probability": row["attack_probability"],
+                        "technique_probability": row["technique_probability"],
+                        "model_task": self.metadata.get("model_task", "unknown"),
+                        "class_names": self.class_names,
+                    },
+                )
+            rows.append(row)
         return rows
+
+    def _classify_probabilities(
+        self,
+        probabilities: list[float],
+        *,
+        threshold: float,
+        fallback_technique_id: str,
+    ) -> dict[str, Any]:
+        """Map classifier probabilities to binary alert + optional MITRE technique."""
+        if len(probabilities) != len(self.class_names):
+            raise ValueError("probability vector does not match classifier class_names")
+
+        normal_index = self.label_to_id.get("normal")
+        if len(probabilities) == 2 and (
+            self.class_names[1] == "attack" or self.class_names[1].startswith("class_")
+        ):
+            attack_probability = float(probabilities[1])
+            is_attack = attack_probability >= threshold
+            return {
+                "prediction": "attack" if is_attack else "normal",
+                "attack_probability": attack_probability,
+                "technique_id": fallback_technique_id if is_attack else None,
+                "technique_probability": attack_probability if is_attack else 0.0,
+                "classification_confidence": attack_probability if is_attack else 0.95,
+            }
+
+        predicted_index = int(max(range(len(probabilities)), key=lambda idx: probabilities[idx]))
+        predicted_class = self.class_names[predicted_index]
+        normal_probability = float(probabilities[normal_index]) if normal_index is not None else 0.0
+        if normal_index is not None:
+            attack_probability = max(0.0, 1.0 - normal_probability)
+        else:
+            attack_probability = float(max(probabilities))
+
+        is_attack = predicted_class != "normal" and attack_probability >= threshold
+        technique_probability = float(probabilities[predicted_index]) if is_attack else 0.0
+        return {
+            "prediction": "attack" if is_attack else "normal",
+            "attack_probability": float(attack_probability),
+            "technique_id": predicted_class if is_attack else None,
+            "technique_probability": technique_probability,
+            "classification_confidence": technique_probability if is_attack else 0.95,
+        }
 
 
 def write_detection_csv(rows: Iterable[dict[str, Any]], output_path: Path) -> int:

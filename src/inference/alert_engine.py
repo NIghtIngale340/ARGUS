@@ -85,6 +85,15 @@ class RiskStore(Protocol):
     def get_all_risks(self) -> dict[str, float]:
         ...
 
+    def get_risk_timeline(
+        self,
+        user_id: str,
+        *,
+        days: int = 30,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        ...
+
     def clear(self) -> None:
         ...
 
@@ -114,6 +123,7 @@ class UEBARiskStore:
         self.default_risk = default_risk
         self._store: dict[str, float] = {}
         self._last_update: dict[str, float] = {}
+        self._history: dict[str, list[dict[str, Any]]] = {}
 
     def get_risk(self, user_id: str) -> float:
         """Get current risk score for a user."""
@@ -133,17 +143,52 @@ class UEBARiskStore:
         normalized = normalize_anomaly_score(anomaly_score)
         new_risk = old_risk * self.decay + normalized * (1.0 - self.decay)
         self._store[user_id] = new_risk
-        self._last_update[user_id] = time.time()
+        now = time.time()
+        self._last_update[user_id] = now
+        self.append_risk_event(user_id, new_risk, timestamp=now)
         return new_risk
 
     def get_all_risks(self) -> dict[str, float]:
         """Return all user risk scores."""
         return dict(self._store)
 
+    def append_risk_event(
+        self,
+        user_id: str,
+        risk: float,
+        *,
+        timestamp: float | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        event = {
+            "timestamp": float(time.time() if timestamp is None else timestamp),
+            "risk": float(risk),
+        }
+        if session_id is not None:
+            event["session_id"] = str(session_id)
+        self._history.setdefault(str(user_id), []).append(event)
+
+    def get_risk_timeline(
+        self,
+        user_id: str,
+        *,
+        days: int = 30,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if days <= 0:
+            raise ValueError("days must be positive")
+        cutoff = float(time.time() if now is None else now) - days * 24 * 60 * 60
+        return [
+            dict(event)
+            for event in self._history.get(str(user_id), [])
+            if float(event["timestamp"]) >= cutoff
+        ]
+
     def clear(self) -> None:
         """Delete all in-memory UEBA risk state."""
         self._store.clear()
         self._last_update.clear()
+        self._history.clear()
 
 
 class RedisUEBARiskStore:
@@ -170,6 +215,7 @@ class RedisUEBARiskStore:
         self.key_prefix = key_prefix.rstrip(":")
         self.risk_key = f"{self.key_prefix}:risk"
         self.last_update_key = f"{self.key_prefix}:last_update"
+        self.history_prefix = f"{self.key_prefix}:risk_history"
 
         if client is None:
             if not redis_url:
@@ -206,6 +252,7 @@ class RedisUEBARiskStore:
         now = time.time()
         self.client.hset(self.risk_key, str(user_id), repr(new_risk))
         self.client.hset(self.last_update_key, str(user_id), repr(now))
+        self.append_risk_event(str(user_id), new_risk, timestamp=now)
         return new_risk
 
     def get_all_risks(self) -> dict[str, float]:
@@ -220,7 +267,58 @@ class RedisUEBARiskStore:
 
     def clear(self) -> None:
         """Delete stored UEBA risk state for tests or local resets."""
-        self.client.delete(self.risk_key, self.last_update_key)
+        history_keys = [
+            self._history_key(user_id)
+            for user_id in self.get_all_risks()
+        ]
+        self.client.delete(self.risk_key, self.last_update_key, *history_keys)
+
+    def append_risk_event(
+        self,
+        user_id: str,
+        risk: float,
+        *,
+        timestamp: float | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        ts = float(time.time() if timestamp is None else timestamp)
+        payload = {
+            "timestamp": ts,
+            "risk": float(risk),
+        }
+        if session_id is not None:
+            payload["session_id"] = str(session_id)
+        key = self._history_key(user_id)
+        self.client.zadd(key, {json.dumps(payload, sort_keys=True): ts})
+        if hasattr(self.client, "expire"):
+            self.client.expire(key, 31 * 24 * 60 * 60)
+
+    def get_risk_timeline(
+        self,
+        user_id: str,
+        *,
+        days: int = 30,
+        now: float | None = None,
+    ) -> list[dict[str, Any]]:
+        if days <= 0:
+            raise ValueError("days must be positive")
+        end = float(time.time() if now is None else now)
+        start = end - days * 24 * 60 * 60
+        raw_items = self.client.zrangebyscore(self._history_key(user_id), start, end)
+        events = []
+        for raw in raw_items:
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            try:
+                event = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        return events
+
+    def _history_key(self, user_id: str) -> str:
+        return f"{self.history_prefix}:{user_id}"
 
 
 class AlertEngine:

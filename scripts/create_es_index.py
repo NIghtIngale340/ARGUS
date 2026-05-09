@@ -54,7 +54,7 @@ INDEX_TEMPLATES = {
     },
 
     "alerts": {
-        "index_patterns": ["alerts-*"],
+        "index_patterns": ["alerts-*", "argus-alerts-*"],
         "template": {
             "settings": {
                 "number_of_shards": 1,
@@ -64,7 +64,19 @@ INDEX_TEMPLATES = {
             "mappings": {
                 "properties": {
                     "@timestamp": {"type": "date"},
+                    "alert_id": {"type": "keyword"},
+                    "user_id": {"type": "keyword"},
+                    "host_id": {"type": "keyword"},
+                    "session_id": {"type": "keyword"},
                     "anomaly_score": {"type": "double"},
+                    "attack_probability": {"type": "double"},
+                    "technique_probability": {"type": "double"},
+                    "technique_id": {"type": "keyword"},
+                    "classification": {"type": "keyword"},
+                    "classification_confidence": {"type": "double"},
+                    "user_risk": {"type": "double"},
+                    "composite_severity": {"type": "double"},
+                    "alert_class": {"type": "keyword"},
                     "severity": {"type": "keyword"},
                     "is_anomaly": {"type": "boolean"},
                     "raw_message": {"type": "text"},

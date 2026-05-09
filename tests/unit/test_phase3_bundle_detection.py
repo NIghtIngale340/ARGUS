@@ -277,6 +277,12 @@ def test_phase3_api_exposes_and_clears_ueba_risks(tmp_path: Path) -> None:
     assert user_payload["exists"] is True
     assert user_payload["risk"] == pytest.approx(all_payload["risks"]["risk_user"])
 
+    timeline = client.get("/phase3/ueba/risks/risk_user/timeline")
+    assert timeline.status_code == 200
+    timeline_payload = timeline.json()
+    assert timeline_payload["count"] >= 1
+    assert timeline_payload["timeline"][0]["risk"] > 0.0
+
     missing_risk = client.get("/phase3/ueba/risks/missing_user")
     assert missing_risk.status_code == 200
     assert missing_risk.json()["exists"] is False

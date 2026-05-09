@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from src.models.attack_classifier import ARGUSClassifier
 from src.models.config import ArgusBertConfig
+from src.training.mitre_dataset import MITREClassificationDataset, collate_mitre_batch
 
 
 class AttackClassificationDataset(Dataset):
@@ -167,23 +168,59 @@ def evaluate(
     n = len(all_labels)
     avg_loss = total_loss / max(n, 1)
 
-    tp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 1)
-    fp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 0)
-    fn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 1)
-    tn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 0)
+    num_classes = int(getattr(model, "num_classes", max(all_labels + all_preds) + 1 if n else 2))
 
-    accuracy = (tp + tn) / max(n, 1)
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+    if num_classes == 2:
+        tp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 1)
+        fp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 0)
+        fn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 1)
+        tn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 0)
+
+        accuracy = (tp + tn) / max(n, 1)
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+        return {
+            "loss": avg_loss,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "macro_f1": f1,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        }
+
+    per_class = []
+    for class_id in range(num_classes):
+        tp = sum(1 for p, l in zip(all_preds, all_labels) if p == class_id and l == class_id)
+        fp = sum(1 for p, l in zip(all_preds, all_labels) if p == class_id and l != class_id)
+        fn = sum(1 for p, l in zip(all_preds, all_labels) if p != class_id and l == class_id)
+        precision = tp / max(tp + fp, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+        support = sum(1 for label in all_labels if label == class_id)
+        per_class.append({
+            "class_id": class_id,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": support,
+        })
+
+    accuracy = sum(1 for p, l in zip(all_preds, all_labels) if p == l) / max(n, 1)
+    macro_precision = float(np.mean([row["precision"] for row in per_class]))
+    macro_recall = float(np.mean([row["recall"] for row in per_class]))
+    macro_f1 = float(np.mean([row["f1"] for row in per_class]))
 
     return {
         "loss": avg_loss,
         "accuracy": accuracy,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "precision": macro_precision,
+        "recall": macro_recall,
+        "f1": macro_f1,
+        "macro_f1": macro_f1,
+        "per_class": per_class,
     }
 
 
@@ -198,8 +235,8 @@ def train(
     """Full fine-tuning loop with early stopping."""
     model.to(device)
 
-    all_labels = [item["label"] for item in train_loader.dataset]
-    class_weights = compute_class_weights(all_labels).to(device)
+    all_labels = [int(item["label"]) for item in train_loader.dataset]
+    class_weights = compute_class_weights(all_labels, num_classes=model.num_classes).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
     optimizer = AdamW(
@@ -216,7 +253,11 @@ def train(
 
     trainable, total = model.count_trainable_params()
     print(f"Parameters: {trainable:,} trainable / {total:,} total")
-    print(f"Class weights: normal={class_weights[0]:.3f}, attack={class_weights[1]:.3f}")
+    weights_text = ", ".join(
+        f"class_{index}={float(weight):.3f}"
+        for index, weight in enumerate(class_weights.detach().cpu())
+    )
+    print(f"Class weights: {weights_text}")
 
     for epoch in range(cfg.epochs):
         model.train()
@@ -254,10 +295,13 @@ def train(
             f"Epoch {epoch+1}/{cfg.epochs} ({elapsed:.1f}s): "
             f"train_loss={epoch_loss/max(epoch_steps,1):.4f} | "
             f"val_loss={val_metrics['loss']:.4f} val_f1={val_metrics['f1']:.4f} "
-            f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f} "
-            f"(TP={val_metrics['tp']} FP={val_metrics['fp']} "
-            f"FN={val_metrics['fn']} TN={val_metrics['tn']})"
+            f"val_prec={val_metrics['precision']:.4f} val_rec={val_metrics['recall']:.4f}"
         )
+        if model.num_classes == 2:
+            print(
+                f"  Confusion: TP={val_metrics['tp']} FP={val_metrics['fp']} "
+                f"FN={val_metrics['fn']} TN={val_metrics['tn']}"
+            )
 
         history.append({
             "epoch": epoch + 1,
@@ -274,6 +318,8 @@ def train(
                 "model_state_dict": model.state_dict(),
                 "config": model.config,
                 "num_classes": model.num_classes,
+                "class_names": getattr(model, "class_names", None),
+                "label_to_id": getattr(model, "label_to_id", None),
                 "epoch": epoch + 1,
                 "best_f1": best_f1,
                 "val_metrics": val_metrics,
@@ -294,8 +340,18 @@ def train(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune ARGUS-BERT for attack classification")
-    parser.add_argument("--normal-manifest", required=True, help="Path to normal sessions manifest .pt")
-    parser.add_argument("--attack-manifest", required=True, help="Path to attack sessions manifest .pt")
+    parser.add_argument("--normal-manifest", help="Path to normal sessions manifest .pt")
+    parser.add_argument("--attack-manifest", help="Path to attack sessions manifest .pt")
+    parser.add_argument("--mitre-manifest", help="Tokenized manifest for MITRE label-driven training")
+    parser.add_argument("--mitre-labels", help="MITRE labels JSONL/CSV from validate_mitre_labels.py")
+    parser.add_argument("--mitre-train-split", default="train")
+    parser.add_argument("--mitre-val-split", default="val")
+    parser.add_argument(
+        "--class-name",
+        action="append",
+        dest="class_names",
+        help="Explicit class name order. Repeat, e.g. normal, T1078, T1021.",
+    )
     parser.add_argument("--checkpoint", required=True, help="Path to pre-trained MLM checkpoint .pt")
     parser.add_argument("--out", required=True, help="Output directory for fine-tuned model")
     parser.add_argument("--epochs", type=int, default=20)
@@ -311,56 +367,90 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    dataset = AttackClassificationDataset(
-        normal_manifest_path=args.normal_manifest,
-        attack_manifest_path=args.attack_manifest,
-        max_normal=args.max_normal,
-        limit_chunks=args.limit_chunks,
-    )
+    mitre_mode = bool(args.mitre_labels or args.mitre_manifest)
+    class_names = args.class_names
+    num_classes = 2
 
-    labels = dataset.labels
-    attack_indices = [i for i, l in enumerate(labels) if l == 1]
-    normal_indices = [i for i, l in enumerate(labels) if l == 0]
+    if mitre_mode:
+        if not args.mitre_labels or not args.mitre_manifest:
+            raise ValueError("--mitre-labels and --mitre-manifest must be provided together")
+        train_dataset = MITREClassificationDataset(
+            args.mitre_manifest,
+            args.mitre_labels,
+            split=args.mitre_train_split,
+            class_names=class_names,
+            limit_chunks=args.limit_chunks,
+        )
+        val_dataset = MITREClassificationDataset(
+            args.mitre_manifest,
+            args.mitre_labels,
+            split=args.mitre_val_split,
+            class_names=train_dataset.class_names,
+            limit_chunks=args.limit_chunks,
+        )
+        labels = train_dataset.labels
+        num_classes = len(train_dataset.class_names)
+        collate = collate_mitre_batch
+        print(f"MITRE classes: {train_dataset.class_names}")
+    else:
+        if not args.normal_manifest or not args.attack_manifest:
+            raise ValueError("--normal-manifest and --attack-manifest are required for binary mode")
+        dataset = AttackClassificationDataset(
+            normal_manifest_path=args.normal_manifest,
+            attack_manifest_path=args.attack_manifest,
+            max_normal=args.max_normal,
+            limit_chunks=args.limit_chunks,
+        )
 
-    n_val_attack = max(1, int(len(attack_indices) * args.val_split))
-    n_val_normal = max(1, int(len(normal_indices) * args.val_split))
+        labels = dataset.labels
+        attack_indices = [i for i, l in enumerate(labels) if l == 1]
+        normal_indices = [i for i, l in enumerate(labels) if l == 0]
 
-    rng = np.random.RandomState(42)
-    rng.shuffle(attack_indices)
-    rng.shuffle(normal_indices)
+        n_val_attack = max(1, int(len(attack_indices) * args.val_split))
+        n_val_normal = max(1, int(len(normal_indices) * args.val_split))
 
-    val_indices = attack_indices[:n_val_attack] + normal_indices[:n_val_normal]
-    train_indices = attack_indices[n_val_attack:] + normal_indices[n_val_normal:]
+        rng = np.random.RandomState(42)
+        rng.shuffle(attack_indices)
+        rng.shuffle(normal_indices)
 
-    train_dataset = torch.utils.data.Subset(dataset, train_indices)
-    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+        val_indices = attack_indices[:n_val_attack] + normal_indices[:n_val_normal]
+        train_indices = attack_indices[n_val_attack:] + normal_indices[n_val_normal:]
+
+        train_dataset = torch.utils.data.Subset(dataset, train_indices)
+        val_dataset = torch.utils.data.Subset(dataset, val_indices)
+        labels = [dataset.labels[i] for i in train_indices]
+        collate = collate_fn
 
     print(f"Train: {len(train_dataset):,} | Val: {len(val_dataset):,}")
 
-    train_labels = [labels[i] for i in train_indices]
+    train_labels = [int(item["label"]) for item in train_dataset]
     sample_weights = []
-    attack_weight = len(train_labels) / max(sum(train_labels), 1)
-    normal_weight = len(train_labels) / max(len(train_labels) - sum(train_labels), 1)
-    for l in train_labels:
-        sample_weights.append(attack_weight if l == 1 else normal_weight)
+    class_counts = np.bincount(train_labels, minlength=num_classes)
+    class_counts = np.maximum(class_counts, 1)
+    class_sample_weights = len(train_labels) / (num_classes * class_counts)
+    for label in train_labels:
+        sample_weights.append(float(class_sample_weights[label]))
     sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size,
-        sampler=sampler, collate_fn=collate_fn,
+        sampler=sampler, collate_fn=collate,
         num_workers=args.num_workers, pin_memory=True,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size,
-        shuffle=False, collate_fn=collate_fn,
+        shuffle=False, collate_fn=collate,
         num_workers=args.num_workers, pin_memory=True,
     )
 
     model = ARGUSClassifier(
-        num_classes=2,
+        num_classes=num_classes,
         freeze_layers=args.freeze_layers,
         classifier_dropout=0.1,
     )
+    if mitre_mode:
+        model.class_names = train_dataset.class_names
+        model.label_to_id = train_dataset.label_to_id
     model.load_pretrained_bert(args.checkpoint)
     print("Loaded pre-trained BERT weights.")
 

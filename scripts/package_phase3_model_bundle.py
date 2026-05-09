@@ -53,6 +53,29 @@ def copy_artifact(src: Path | None, out_dir: Path, name: str) -> str | None:
     return dst.name
 
 
+def read_classifier_metadata(path: Path) -> dict[str, Any]:
+    try:
+        import torch
+    except ModuleNotFoundError:
+        return {}
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(checkpoint, dict):
+        return {}
+    num_classes = checkpoint.get("num_classes")
+    class_names = checkpoint.get("class_names")
+    label_to_id = checkpoint.get("label_to_id")
+    return {
+        "num_classes": num_classes,
+        "class_names": class_names if isinstance(class_names, list) else None,
+        "label_to_id": label_to_id if isinstance(label_to_id, dict) else None,
+        "model_task": (
+            "mitre_multiclass_classification"
+            if isinstance(num_classes, int) and num_classes > 2
+            else "binary_attack_classification"
+        ),
+    }
+
+
 def build_metadata(
     *,
     copied_files: dict[str, str | None],
@@ -61,6 +84,7 @@ def build_metadata(
     vocab_path: Path,
     max_seq_len: int,
     status: str,
+    classifier_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     with vocab_path.open("r", encoding="utf-8") as file_obj:
         vocab = json.load(file_obj)
@@ -82,10 +106,15 @@ def build_metadata(
         or operating_metrics.get("threshold")
     )
 
+    classifier_metadata = classifier_metadata or {}
     return {
         "phase": "3",
         "status": status,
         "bundle_format": "argus_phase3_model_bundle_v1",
+        "model_task": classifier_metadata.get("model_task", "binary_attack_classification"),
+        "num_classes": classifier_metadata.get("num_classes"),
+        "class_names": classifier_metadata.get("class_names"),
+        "label_to_id": classifier_metadata.get("label_to_id"),
         "files": copied_files,
         "vocab_size": len(vocab),
         "max_seq_len": max_seq_len,
@@ -170,6 +199,7 @@ def main(args: Namespace | None = None) -> None:
         vocab_path=vocab,
         max_seq_len=parsed.max_seq_len,
         status=parsed.status,
+        classifier_metadata=read_classifier_metadata(classifier),
     )
     metadata_path = out_dir / "model_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
