@@ -65,6 +65,7 @@ INDEX_TEMPLATES = {
                     "user_id": {"type": "keyword"},
                     "host_id": {"type": "keyword"},
                     "session_id": {"type": "keyword"},
+                    "replay_run_id": {"type": "keyword"},
                     "anomaly_score": {"type": "double"},
                     "attack_probability": {"type": "double"},
                     "technique_probability": {"type": "double"},

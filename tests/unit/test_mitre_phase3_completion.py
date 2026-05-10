@@ -217,6 +217,7 @@ def test_phase3_detection_emits_mitre_fields_and_persists_alert(tmp_path: Path) 
                 "session_id": "s1",
                 "user_id": "u1",
                 "host_id": "h1",
+                "replay_run_id": "run-1",
                 "events": [{"event_id": "NA", "auth_type": "NTLM", "logon_type": "Network"}],
             }
         ]
@@ -225,16 +226,66 @@ def test_phase3_detection_emits_mitre_fields_and_persists_alert(tmp_path: Path) 
     assert len(rows) == 1
     assert "technique_id" in rows[0]
     assert "technique_probability" in rows[0]
+    assert rows[0]["replay_run_id"] == "run-1"
     assert len(alert_store.alerts) == int(rows[0]["alert_generated"])
+    if alert_store.alerts:
+        assert alert_store.alerts[0]["replay_run_id"] == "run-1"
 
 
 class FakeElasticsearch:
     def __init__(self) -> None:
         self.indexed = []
+        self.search_calls = []
 
     def index(self, *, index: str, id: str, document: dict) -> dict:
         self.indexed.append({"index": index, "id": id, "document": document})
         return {"_id": id}
+
+    def search(self, *, index: str, query: dict, sort: list, size: int) -> dict:
+        self.search_calls.append(
+            {"index": index, "query": query, "sort": sort, "size": size}
+        )
+        return {
+            "hits": {
+                "hits": [
+                    {
+                        "_id": "alert_1",
+                        "_source": {
+                            "alert_id": "alert_1",
+                            "user_id": "u1",
+                            "replay_run_id": "run-1",
+                        },
+                    }
+                ]
+            }
+        }
+
+
+class FakeApiResponse:
+    def __init__(self, body: dict) -> None:
+        self.body = body
+
+
+class FakeElasticsearchObjectResponse(FakeElasticsearch):
+    def search(self, *, index: str, query: dict, sort: list, size: int) -> FakeApiResponse:
+        self.search_calls.append(
+            {"index": index, "query": query, "sort": sort, "size": size}
+        )
+        return FakeApiResponse(
+            {
+                "hits": {
+                    "hits": [
+                        {
+                            "_id": "alert_obj",
+                            "_source": {
+                                "user_id": "u2",
+                                "replay_run_id": "run-2",
+                            },
+                        }
+                    ]
+                }
+            }
+        )
 
 
 def test_elasticsearch_alert_store_uses_daily_argus_alert_index() -> None:
@@ -262,3 +313,48 @@ def test_elasticsearch_alert_store_uses_daily_argus_alert_index() -> None:
     assert client.indexed[0]["index"].startswith("argus-alerts-")
     assert client.indexed[0]["document"]["technique_id"] == "T1078"
     assert client.indexed[0]["document"]["attack_probability"] == 0.9
+
+
+def test_elasticsearch_alert_store_searches_with_filters() -> None:
+    client = FakeElasticsearch()
+    store = ElasticsearchAlertStore(client=client)
+
+    rows = store.search_alerts(
+        user_id="u1",
+        replay_run_id="run-1",
+        min_severity=0.6,
+        limit=25,
+    )
+
+    assert rows == [{"alert_id": "alert_1", "user_id": "u1", "replay_run_id": "run-1"}]
+    assert client.search_calls[0]["index"] == "argus-alerts-*"
+    assert client.search_calls[0]["size"] == 25
+    filters = client.search_calls[0]["query"]["bool"]["filter"]
+    assert {
+        "bool": {
+            "should": [
+                {"term": {"user_id": "u1"}},
+                {"term": {"user_id.keyword": "u1"}},
+            ],
+            "minimum_should_match": 1,
+        }
+    } in filters
+    assert {
+        "bool": {
+            "should": [
+                {"term": {"replay_run_id": "run-1"}},
+                {"term": {"replay_run_id.keyword": "run-1"}},
+            ],
+            "minimum_should_match": 1,
+        }
+    } in filters
+
+
+def test_elasticsearch_alert_store_extracts_object_api_response() -> None:
+    store = ElasticsearchAlertStore(client=FakeElasticsearchObjectResponse())
+
+    rows = store.search_alerts(replay_run_id="run-2")
+
+    assert rows == [
+        {"alert_id": "alert_obj", "user_id": "u2", "replay_run_id": "run-2"}
+    ]

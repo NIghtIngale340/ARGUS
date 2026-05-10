@@ -35,6 +35,11 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--min-detections", type=int, default=1)
     parser.add_argument("--from-beginning", action="store_true")
+    parser.add_argument(
+        "--replay-run-id",
+        default=os.getenv("ARGUS_REPLAY_RUN_ID"),
+        help="Only count detections and Elasticsearch alerts for this replay_run_id.",
+    )
     parser.add_argument("--skip-kafka", action="store_true")
     parser.add_argument("--skip-elasticsearch", action="store_true")
     parser.add_argument(
@@ -53,6 +58,7 @@ def consume_detection_samples(
     timeout_seconds: float,
     min_detections: int,
     from_beginning: bool = False,
+    replay_run_id: str | None = None,
 ) -> list[dict[str, Any]]:
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be > 0")
@@ -90,13 +96,20 @@ def consume_detection_samples(
                 continue
             payload = json.loads(value.decode("utf-8"))
             if isinstance(payload, dict):
+                if replay_run_id and str(payload.get("replay_run_id", "")) != str(replay_run_id):
+                    continue
                 rows.append(payload)
     finally:
         consumer.close()
     return rows
 
 
-def count_elasticsearch_alerts(*, es_url: str, index_pattern: str) -> int:
+def count_elasticsearch_alerts(
+    *,
+    es_url: str,
+    index_pattern: str,
+    replay_run_id: str | None = None,
+) -> int:
     try:
         from elasticsearch import Elasticsearch, NotFoundError
     except ModuleNotFoundError as exc:
@@ -107,7 +120,22 @@ def count_elasticsearch_alerts(*, es_url: str, index_pattern: str) -> int:
 
     client = Elasticsearch(es_url)
     try:
-        response = client.count(index=index_pattern)
+        if replay_run_id:
+            query = {
+                "bool": {
+                    "should": [
+                        {"term": {"replay_run_id": str(replay_run_id)}},
+                        {"term": {"replay_run_id.keyword": str(replay_run_id)}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            }
+            try:
+                response = client.count(index=index_pattern, query=query)
+            except TypeError:
+                response = client.count(index=index_pattern, body={"query": query})
+        else:
+            response = client.count(index=index_pattern)
     except NotFoundError:
         return 0
     return int(response.get("count", 0))
@@ -124,10 +152,12 @@ def main(args: Namespace | None = None) -> int:
             timeout_seconds=parsed.timeout_seconds,
             min_detections=parsed.min_detections,
             from_beginning=parsed.from_beginning,
+            replay_run_id=parsed.replay_run_id,
         )
         print(
             f"Kafka detections: {len(detections):,} "
             f"from topic {parsed.detections_topic}"
+            + (f" for replay_run_id={parsed.replay_run_id}" if parsed.replay_run_id else "")
         )
         for row in detections[:3]:
             print(json.dumps(row, sort_keys=True))
@@ -140,8 +170,12 @@ def main(args: Namespace | None = None) -> int:
         alert_count = count_elasticsearch_alerts(
             es_url=parsed.es_url,
             index_pattern=parsed.alert_index,
+            replay_run_id=parsed.replay_run_id,
         )
-        print(f"Elasticsearch alerts: {alert_count:,} in {parsed.alert_index}")
+        print(
+            f"Elasticsearch alerts: {alert_count:,} in {parsed.alert_index}"
+            + (f" for replay_run_id={parsed.replay_run_id}" if parsed.replay_run_id else "")
+        )
         if alert_count < parsed.min_alerts:
             failures.append(
                 f"expected at least {parsed.min_alerts} Elasticsearch alert(s)"

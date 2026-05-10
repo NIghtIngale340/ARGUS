@@ -68,12 +68,18 @@ class StreamingSessionProcessor:
         """Process one parsed event and return detections for flushed sessions."""
         user_id, host_id = extract_user_host(event)
         token_id = self.extract_token_id(event)
+        replay_run_id = extract_replay_run_id(event)
 
-        self.tracker.append(user_id, host_id, token_id)
-        if not self.tracker.is_complete(user_id, host_id):
+        self.tracker.append(
+            user_id,
+            host_id,
+            token_id,
+            replay_run_id=replay_run_id,
+        )
+        if not self.tracker.is_complete(user_id, host_id, replay_run_id=replay_run_id):
             return []
 
-        token_ids = self.tracker.flush(user_id, host_id)
+        token_ids = self.tracker.flush(user_id, host_id, replay_run_id=replay_run_id)
         if not token_ids:
             return []
 
@@ -116,6 +122,7 @@ class StreamingSessionProcessor:
             "host_id": host_id,
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
+            **_detection_metadata_from_event(source_event),
         }
 
     def _build_model_inputs(self, token_ids: list[int]) -> tuple[list[int], list[int]]:
@@ -146,6 +153,9 @@ class StreamingSessionProcessor:
             enriched["last_event_time"] = source_event["event_time"]
         elif "timestamp" in source_event:
             enriched["last_event_time"] = source_event["timestamp"]
+        replay_run_id = extract_replay_run_id(source_event)
+        if replay_run_id is not None:
+            enriched["replay_run_id"] = replay_run_id
         return enriched
 
 
@@ -163,6 +173,22 @@ def extract_user_host(event: Mapping[str, Any]) -> tuple[str, str]:
     if host_id is None or str(host_id) == "":
         raise ValueError("event is missing host_id/host/computer/src_host")
     return str(user_id), str(host_id)
+
+
+def extract_replay_run_id(event: Mapping[str, Any]) -> str | None:
+    """Extract the optional replay run identifier from a streaming event."""
+    replay_run_id = event.get("replay_run_id") or event.get("run_id")
+    if replay_run_id is None or str(replay_run_id) == "":
+        return None
+    return str(replay_run_id)
+
+
+def _detection_metadata_from_event(event: Mapping[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    replay_run_id = extract_replay_run_id(event)
+    if replay_run_id is not None:
+        metadata["replay_run_id"] = replay_run_id
+    return metadata
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -294,6 +320,7 @@ __all__ = [
     "consume",
     "create_alert_store_from_env",
     "create_streaming_processor_from_env",
+    "extract_replay_run_id",
     "extract_user_host",
     "get_streaming_processor",
     "reset_streaming_processor",

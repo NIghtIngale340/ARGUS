@@ -98,6 +98,20 @@ def test_sessions_are_isolated_by_user_and_host() -> None:
     assert tracker.flush("user_b", "host_1") == [300]
 
 
+def test_sessions_are_isolated_by_replay_run_id() -> None:
+    client = FakeRedis()
+    tracker = SessionTracker(client=client, max_tokens=2)
+
+    tracker.append("user_a", "host_1", 100, replay_run_id="run_a")
+    tracker.append("user_a", "host_1", 200, replay_run_id="run_b")
+    tracker.append("user_a", "host_1", 101, replay_run_id="run_a")
+
+    assert tracker.is_complete("user_a", "host_1", replay_run_id="run_a")
+    assert not tracker.is_complete("user_a", "host_1", replay_run_id="run_b")
+    assert tracker.flush("user_a", "host_1", replay_run_id="run_a") == [100, 101]
+    assert tracker.flush("user_a", "host_1", replay_run_id="run_b") == [200]
+
+
 def test_state_persists_across_tracker_instances_with_same_client() -> None:
     client = FakeRedis()
     first = SessionTracker(client=client, max_tokens=2, key_prefix="test:sessions")

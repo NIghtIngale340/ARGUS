@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Protocol
+from uuid import uuid4
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -110,32 +111,58 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Print sample events; do not publish")
     parser.add_argument("--default-user-id", default=DEFAULT_USER_ID)
     parser.add_argument("--default-host-id", default=DEFAULT_HOST_ID)
+    parser.add_argument(
+        "--replay-run-id",
+        default=os.getenv("ARGUS_REPLAY_RUN_ID") or f"replay-{uuid4().hex}",
+        help=(
+            "Run identifier attached to every replayed event. Defaults to "
+            "ARGUS_REPLAY_RUN_ID or a generated replay-* value."
+        ),
+    )
     return parser
 
 
 def iter_replay_events(args: Namespace) -> Iterator[dict[str, Any]]:
+    replay_run_id = getattr(args, "replay_run_id", None)
     tokenizer = (
         LogTokenizer(args.vocab, max_len=args.max_seq_len)
         if getattr(args, "vocab", None)
         else None
     )
     if getattr(args, "sessions_parquet", None):
-        yield from iter_parquet_events(
-            Path(args.sessions_parquet),
-            tokenizer=tokenizer,
-            batch_size=args.batch_size,
-            limit_sessions=args.limit_sessions,
-            default_user_id=args.default_user_id,
-            default_host_id=args.default_host_id,
+        yield from _attach_replay_run_id(
+            iter_parquet_events(
+                Path(args.sessions_parquet),
+                tokenizer=tokenizer,
+                batch_size=args.batch_size,
+                limit_sessions=args.limit_sessions,
+                default_user_id=args.default_user_id,
+                default_host_id=args.default_host_id,
+            ),
+            replay_run_id,
         )
         return
 
-    yield from iter_manifest_events(
-        Path(args.manifest),
-        limit_sessions=args.limit_sessions,
-        default_user_id=args.default_user_id,
-        default_host_id=args.default_host_id,
+    yield from _attach_replay_run_id(
+        iter_manifest_events(
+            Path(args.manifest),
+            limit_sessions=args.limit_sessions,
+            default_user_id=args.default_user_id,
+            default_host_id=args.default_host_id,
+        ),
+        replay_run_id,
     )
+
+
+def _attach_replay_run_id(
+    events: Iterable[Mapping[str, Any]],
+    replay_run_id: str | None,
+) -> Iterator[dict[str, Any]]:
+    for event in events:
+        payload = dict(event)
+        if replay_run_id:
+            payload["replay_run_id"] = str(replay_run_id)
+        yield payload
 
 
 def iter_parquet_events(
@@ -326,6 +353,8 @@ def main(args: Namespace | None = None) -> int:
         sleep_seconds=parsed.sleep_seconds,
     )
     print(f"Replayed {emitted:,} event(s) to {parsed.topic}")
+    if getattr(parsed, "replay_run_id", None):
+        print(f"Replay run ID: {parsed.replay_run_id}")
     return emitted
 
 

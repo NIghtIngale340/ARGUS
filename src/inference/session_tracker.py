@@ -50,15 +50,31 @@ class SessionTracker:
             )
         self.client = client
 
-    def session_key(self, user_id: str, host_id: str) -> str:
+    def session_key(
+        self,
+        user_id: str,
+        host_id: str,
+        *,
+        replay_run_id: str | None = None,
+    ) -> str:
         """Return the Redis key for a user/host streaming session."""
-        raw = json.dumps([str(user_id), str(host_id)], separators=(",", ":"))
+        raw = json.dumps(
+            [str(user_id), str(host_id), str(replay_run_id or "")],
+            separators=(",", ":"),
+        )
         digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
         return f"{self.key_prefix}:tokens:{digest}"
 
-    def append(self, user_id: str, host_id: str, token_id: int) -> int:
+    def append(
+        self,
+        user_id: str,
+        host_id: str,
+        token_id: int,
+        *,
+        replay_run_id: str | None = None,
+    ) -> int:
         """Append one token and return the current token count."""
-        key = self.session_key(user_id, host_id)
+        key = self.session_key(user_id, host_id, replay_run_id=replay_run_id)
         count = self.client.rpush(key, str(int(token_id)))
         if self.ttl_seconds is not None:
             self.client.expire(key, self.ttl_seconds)
@@ -66,14 +82,26 @@ class SessionTracker:
             return int(self.client.llen(key))
         return int(count)
 
-    def is_complete(self, user_id: str, host_id: str) -> bool:
+    def is_complete(
+        self,
+        user_id: str,
+        host_id: str,
+        *,
+        replay_run_id: str | None = None,
+    ) -> bool:
         """Return True when the user/host session reached ``max_tokens``."""
-        key = self.session_key(user_id, host_id)
+        key = self.session_key(user_id, host_id, replay_run_id=replay_run_id)
         return int(self.client.llen(key)) >= self.max_tokens
 
-    def flush(self, user_id: str, host_id: str) -> list[int]:
+    def flush(
+        self,
+        user_id: str,
+        host_id: str,
+        *,
+        replay_run_id: str | None = None,
+    ) -> list[int]:
         """Return accumulated token IDs and delete the stored session."""
-        key = self.session_key(user_id, host_id)
+        key = self.session_key(user_id, host_id, replay_run_id=replay_run_id)
 
         if hasattr(self.client, "pipeline"):
             pipe = self.client.pipeline()
@@ -86,9 +114,15 @@ class SessionTracker:
 
         return [self._coerce_token_id(value) for value in values]
 
-    def clear(self, user_id: str, host_id: str) -> None:
+    def clear(
+        self,
+        user_id: str,
+        host_id: str,
+        *,
+        replay_run_id: str | None = None,
+    ) -> None:
         """Delete any accumulated token IDs for a user/host pair."""
-        self.client.delete(self.session_key(user_id, host_id))
+        self.client.delete(self.session_key(user_id, host_id, replay_run_id=replay_run_id))
 
     @staticmethod
     def _coerce_token_id(value: Any) -> int:

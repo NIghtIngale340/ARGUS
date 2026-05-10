@@ -179,6 +179,20 @@ def test_source_session_id_is_preserved() -> None:
     assert detector.batches[0][0]["session_id"] == "upstream_session_1"
 
 
+def test_replay_run_id_is_preserved_and_isolates_tracker_state() -> None:
+    processor, detector = make_processor(max_tokens=2)
+    base_event = {"user_id": "user_a", "host_id": "host_1"}
+
+    assert processor.process_event({**base_event, "token_id": 10, "replay_run_id": "run_a"}) == []
+    assert processor.process_event({**base_event, "token_id": 20, "replay_run_id": "run_b"}) == []
+    rows = processor.process_event({**base_event, "token_id": 11, "replay_run_id": "run_a"})
+
+    assert len(rows) == 1
+    assert rows[0]["replay_run_id"] == "run_a"
+    assert detector.batches[0][0]["replay_run_id"] == "run_a"
+    assert detector.batches[0][0]["input_ids"].tolist() == [0, 10, 11, 1, 3, 3]
+
+
 def test_extract_user_host_accepts_common_field_names() -> None:
     assert extract_user_host({"user": "u1", "computer": "h1"}) == ("u1", "h1")
     assert extract_user_host({"src_user": "u2", "src_host": "h2"}) == ("u2", "h2")

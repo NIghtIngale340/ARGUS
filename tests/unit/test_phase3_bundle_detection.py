@@ -13,6 +13,7 @@ import torch
 from scripts.package_phase3_model_bundle import main as package_bundle_main
 from scripts.run_detection import main as run_detection_main
 from src.api.main import create_app
+from src.inference.alert_store import InMemoryAlertStore
 from src.models.attack_classifier import ARGUSClassifier
 from src.models.config import ArgusBertConfig
 
@@ -306,3 +307,62 @@ def test_phase3_api_exposes_and_clears_ueba_risks(tmp_path: Path) -> None:
 
     after_clear = client.get("/phase3/ueba/risks")
     assert after_clear.json()["risks"] == {}
+
+
+def test_phase3_api_lists_and_fetches_alerts(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi.testclient")
+    bundle_dir = _package_bundle(tmp_path)
+    app = create_app(bundle_dir=str(bundle_dir), alert_store=InMemoryAlertStore())
+    client = fastapi.TestClient(app)
+
+    detection = client.post(
+        "/phase3/detect",
+        json={
+            "threshold": 0.0,
+            "sessions": [
+                {
+                    "session_id": "alert_s1",
+                    "user_id": "alert_user",
+                    "host_id": "alert_host",
+                    "replay_run_id": "run-alert-1",
+                    "events": [
+                        {
+                            "event_id": "NA",
+                            "auth_type": "NTLM",
+                            "logon_type": "Network",
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert detection.status_code == 200
+
+    alerts = client.get(
+        "/phase3/alerts",
+        params={"user_id": "alert_user", "replay_run_id": "run-alert-1"},
+    )
+
+    assert alerts.status_code == 200
+    payload = alerts.json()
+    assert payload["count"] == 1
+    assert payload["alerts"][0]["session_id"] == "alert_s1"
+    assert payload["alerts"][0]["replay_run_id"] == "run-alert-1"
+
+    alert_id = payload["alerts"][0]["alert_id"]
+    one_alert = client.get(f"/phase3/alerts/{alert_id}")
+    assert one_alert.status_code == 200
+    assert one_alert.json()["alert"]["alert_id"] == alert_id
+
+
+def test_phase3_api_alert_query_requires_configured_store(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi.testclient")
+    bundle_dir = _package_bundle(tmp_path)
+    app = create_app(bundle_dir=str(bundle_dir))
+    app.state.alert_store = None
+    app.state.elasticsearch_alerts_enabled = False
+    client = fastapi.TestClient(app)
+
+    response = client.get("/phase3/alerts")
+
+    assert response.status_code == 503

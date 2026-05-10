@@ -28,6 +28,7 @@ DETECTION_FIELDNAMES = [
     "session_id",
     "user_id",
     "host_id",
+    "replay_run_id",
     "attack_probability",
     "prediction",
     "technique_id",
@@ -37,6 +38,7 @@ DETECTION_FIELDNAMES = [
     "alert_class",
     "composite_severity",
 ]
+DETECTION_METADATA_FIELDS = ("replay_run_id",)
 
 
 @dataclass(frozen=True)
@@ -303,13 +305,18 @@ class Phase3DetectionService:
         input_ids, attention_mask = self.tokenizer.tokenize_with_attention_mask(
             mutable_session
         )
-        return {
+        item = {
             "session_id": mutable_session.get("session_id", row_index),
             "user_id": mutable_session.get("user_id", ""),
             "host_id": mutable_session.get("host_id", ""),
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attention_mask, dtype=torch.bool),
         }
+        for field in DETECTION_METADATA_FIELDS:
+            value = mutable_session.get(field)
+            if value is not None and str(value) != "":
+                item[field] = str(value)
+        return item
 
     def iter_jsonl_sessions(self, path: Path) -> Iterator[dict[str, Any]]:
         with path.open("r", encoding="utf-8") as file_obj:
@@ -394,15 +401,23 @@ class Phase3DetectionService:
                 "alert_class": alert.alert_class if alert else "",
                 "composite_severity": alert.composite_severity if alert else "",
             }
+            for field in DETECTION_METADATA_FIELDS:
+                value = item.get(field)
+                if value is not None and str(value) != "":
+                    row[field] = str(value)
             if alert is not None and self.alert_store is not None:
+                alert_extra = {
+                    "attack_probability": row["attack_probability"],
+                    "technique_probability": row["technique_probability"],
+                    "model_task": self.metadata.get("model_task", "unknown"),
+                    "class_names": self.class_names,
+                }
+                for field in DETECTION_METADATA_FIELDS:
+                    if field in row:
+                        alert_extra[field] = row[field]
                 self.alert_store.index_alert(
                     alert,
-                    extra={
-                        "attack_probability": row["attack_probability"],
-                        "technique_probability": row["technique_probability"],
-                        "model_task": self.metadata.get("model_task", "unknown"),
-                        "class_names": self.class_names,
-                    },
+                    extra=alert_extra,
                 )
             rows.append(row)
         return rows

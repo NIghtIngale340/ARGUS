@@ -193,6 +193,36 @@ def test_replay_events_sends_json_payloads_to_topic() -> None:
     ]
 
 
+def test_iter_replay_events_attaches_replay_run_id(tmp_path: Path) -> None:
+    parquet_path = tmp_path / "events.parquet"
+    pd.DataFrame(
+        [
+            {
+                "session_id": "s1",
+                "user_id": "u1",
+                "host_id": "h1",
+                "token_id": 5,
+            }
+        ]
+    ).to_parquet(parquet_path, index=False)
+
+    args = Namespace(
+        sessions_parquet=str(parquet_path),
+        manifest=None,
+        vocab=None,
+        max_seq_len=16,
+        batch_size=100,
+        limit_sessions=None,
+        default_user_id="u1",
+        default_host_id="h1",
+        replay_run_id="replay-test-1",
+    )
+
+    events = list(iter_replay_events(args))
+
+    assert events[0]["replay_run_id"] == "replay-test-1"
+
+
 def test_iter_replay_events_routes_manifest_input(tmp_path: Path) -> None:
     tokenized = tmp_path / "tokenized"
     chunk_dir = tokenized / "sessions_test_chunks"
