@@ -1,0 +1,51 @@
+# Keep Docker build context source-only. Runtime artifacts are mounted, not baked.
+
+# VCS and local environment
+.git
+.gitignore
+.github
+.vscode
+.env
+.env.*
+!.env.example
+.venv
+venv
+
+# Generated data, models, and experiment outputs
+data
+checkpoints
+models
+reports
+certs
+mlruns
+logs
+*.pt
+*.ckpt
+*.parquet
+*.jsonl
+*.csv
+*.csv.tmp
+*.zip
+
+# Notebook outputs and caches
+notebooks
+.ipynb_checkpoints
+__pycache__
+*.py[cod]
+*$py.class
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+coverage.xml
+htmlcov
+build
+dist
+*.egg-info
+
+# Host/editor noise
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak

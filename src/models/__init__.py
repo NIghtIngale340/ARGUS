@@ -1,6 +1,7 @@
-"""Model scaffolds for ARGUS Phase 2."""
+"""ARGUS model definitions."""
 
 __all__ = [
     "argus_bert",
+    "attack_classifier",
     "config",
 ]

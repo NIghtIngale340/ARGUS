@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -20,6 +21,14 @@ except Exception:
 
 DEFAULT_RAW_TOPIC = "argus.raw-logs"
 DEFAULT_DETECTIONS_TOPIC = "argus.detections"
+DEFAULT_DEAD_LETTER_TOPIC = "argus.dead-letter"
+
+
+@dataclass(frozen=True)
+class PendingDetection:
+    item: dict[str, Any]
+    token_ids: list[int]
+    source_event: Mapping[str, Any]
 
 
 class StreamingSessionProcessor:
@@ -66,6 +75,17 @@ class StreamingSessionProcessor:
 
     def process_event(self, event: Mapping[str, Any]) -> list[dict[str, Any]]:
         """Process one parsed event and return detections for flushed sessions."""
+        pending = self.process_event_to_item(event)
+        if pending is None:
+            return []
+        rows = self.detector.score_items([pending.item])
+        return [
+            self._annotate_detection(row, pending.token_ids, pending.source_event)
+            for row in rows
+        ]
+
+    def process_event_to_item(self, event: Mapping[str, Any]) -> PendingDetection | None:
+        """Process one event and return a completed detection item when ready."""
         user_id, host_id = extract_user_host(event)
         token_id = self.extract_token_id(event)
         replay_run_id = extract_replay_run_id(event)
@@ -77,11 +97,11 @@ class StreamingSessionProcessor:
             replay_run_id=replay_run_id,
         )
         if not self.tracker.is_complete(user_id, host_id, replay_run_id=replay_run_id):
-            return []
+            return None
 
         token_ids = self.tracker.flush(user_id, host_id, replay_run_id=replay_run_id)
         if not token_ids:
-            return []
+            return None
 
         item = self.build_detection_item(
             token_ids,
@@ -89,8 +109,7 @@ class StreamingSessionProcessor:
             host_id=host_id,
             source_event=event,
         )
-        rows = self.detector.score_items([item])
-        return [self._annotate_detection(row, token_ids, event) for row in rows]
+        return PendingDetection(item=item, token_ids=token_ids, source_event=event)
 
     def extract_token_id(self, event: Mapping[str, Any]) -> int:
         """Get a token ID from the event or encode it with the detector tokenizer."""
@@ -314,7 +333,9 @@ else:
 
 __all__ = [
     "DEFAULT_DETECTIONS_TOPIC",
+    "DEFAULT_DEAD_LETTER_TOPIC",
     "DEFAULT_RAW_TOPIC",
+    "PendingDetection",
     "StreamingSessionProcessor",
     "app",
     "consume",

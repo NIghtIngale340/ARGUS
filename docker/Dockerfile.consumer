@@ -1,19 +1,24 @@
+# syntax=docker/dockerfile:1.7
+
 FROM python:3.11-slim AS builder
 
-ENV POETRY_VERSION=2.3.2 \
-    POETRY_HOME=/opt/poetry \
-    POETRY_VIRTUALENVS_CREATE=false \
+ENV VIRTUAL_ENV=/opt/venv \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/opt/poetry/bin:/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH"
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl build-essential && rm -rf /var/lib/apt/lists/*
-RUN python -m venv /opt/venv && pip install --no-cache-dir --upgrade pip && pip install --no-cache-dir poetry==${POETRY_VERSION}
+ARG TORCH_CPU_VERSION=2.5.1+cpu
+
+RUN python -m venv /opt/venv
 
 WORKDIR /app
 
-COPY pyproject.toml poetry.lock ./
-RUN poetry lock --no-interaction --no-ansi && poetry install --only main --no-interaction --no-ansi
+COPY requirements/base.txt ./requirements/base.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    grep -vE '^torch([<>= ].*)?$' requirements/base.txt > /tmp/requirements-no-torch.txt \
+    && pip install --upgrade pip \
+    && pip install --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_CPU_VERSION}" \
+    && pip install -r /tmp/requirements-no-torch.txt
 
 COPY src ./src
 COPY scripts ./scripts
@@ -23,14 +28,14 @@ FROM python:3.11-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH="/usr/local/bin:/opt/venv/bin:$PATH"
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /usr/local /usr/local
 COPY --from=builder /app/src ./src
 COPY --from=builder /app/scripts ./scripts
 COPY --from=builder /app/configs ./configs
 
-CMD ["/usr/local/bin/python", "-m", "scripts.run_phase4_streaming_consumer"]
+CMD ["python", "-m", "scripts.run_phase4_streaming_consumer"]

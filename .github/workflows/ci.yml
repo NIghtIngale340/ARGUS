@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install Poetry
+        run: python -m pip install --upgrade pip poetry==2.3.2
+      - name: Install dependencies
+        run: poetry install --with dev --no-interaction --no-ansi
+      - name: Poetry check
+        run: poetry check
+      - name: Unit tests
+        run: poetry run pytest -q
+      - name: Docker Compose config
+        run: docker compose config --quiet
+      - name: Notebook JSON validation
+        run: |
+          poetry run python - <<'PY'
+          import json
+          from pathlib import Path
+          for path in Path("notebooks").glob("*.ipynb"):
+              json.loads(path.read_text(encoding="utf-8"))
+          print("notebook JSON ok")
+          PY
+      - name: Dependency audit
+        continue-on-error: true
+        run: poetry run pip-audit

@@ -32,6 +32,14 @@ TOPIC_SPECS = [
         },
     },
     {
+        "name": "argus.dead-letter",
+        "partitions": 3,
+        "replication_factor": 1,
+        "config": {
+            "retention.ms": "1209600000",  # 14 days
+        },
+    },
+    {
         "name": "logs.raw",
         "partitions": 6,
         "replication_factor": 1,

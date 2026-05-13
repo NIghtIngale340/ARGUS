@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""
-ARGUS — Pre-flight Service Health Check
+"""ARGUS pre-flight service health check.
 
 Validates connectivity to Elasticsearch, Kafka, Redis, and MLflow
 before starting any ARGUS service. Runs all checks regardless of
@@ -95,7 +94,7 @@ def check_mlflow() -> bool:
 def main():
     """Run all health checks and exit with appropriate code."""
     print("=" * 60)
-    print("  ARGUS — Service Health Check")
+    print("  ARGUS - Service Health Check")
     print("=" * 60)
     print()
 

@@ -352,7 +352,7 @@ def run_alert_engine(
             anomaly_score=prob * anomaly_ceiling,
             classification="attack" if is_attack_prediction else "normal",
             classification_confidence=prob if is_attack_prediction else 0.95,
-            technique_id="T1078" if is_attack_prediction else None,
+            technique_id=None,
         ))
 
     alerts = engine.process_batch(sessions)

@@ -13,7 +13,9 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - torch is a project dependency.
     torch = None  # type: ignore[assignment]
     IterableDataset = object  # type: ignore[misc,assignment]
-    get_worker_info = lambda: None  # type: ignore[assignment]
+
+    def get_worker_info() -> None:  # type: ignore[no-redef]
+        return None
 
 @dataclass(frozen=True)
 class TokenizedManifestDatasetConfig:

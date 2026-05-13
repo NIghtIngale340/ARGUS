@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import base64
 import csv
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,12 @@ from src.inference.alert_store import InMemoryAlertStore
 from src.models.attack_classifier import ARGUSClassifier
 from src.models.config import ArgusBertConfig
 
+os.environ.setdefault("ARGUS_API_KEY", "test-api-key")
+os.environ.setdefault("ARGUS_ADMIN_API_KEY", "test-admin-key")
+
+AUTH_HEADERS = {"X-ARGUS-API-Key": "test-api-key"}
+ADMIN_HEADERS = {"X-ARGUS-API-Key": "test-api-key", "X-ARGUS-Admin-Key": "test-admin-key"}
+
 
 VOCAB = {
     "[CLS]": 0,
@@ -27,6 +35,12 @@ VOCAB = {
     "NA_NTLM_Network": 5,
     "NA_Kerberos_Interactive": 6,
 }
+
+
+def _authed_client(fastapi, app):
+    client = fastapi.TestClient(app)
+    client.headers.update(AUTH_HEADERS)
+    return client
 
 
 def _write_json(path: Path, payload: object) -> Path:
@@ -196,6 +210,9 @@ def test_run_detection_cli_scores_jsonl_from_bundle(tmp_path: Path) -> None:
     assert rows[0]["session_id"] == "s1"
     assert rows[0]["prediction"] == "attack"
     assert rows[0]["threshold"] == "0.0"
+    assert rows[0]["threshold_source"] == "cli_override"
+    assert rows[0]["technique_source"] == "fallback"
+    assert rows[0]["fallback_technique_id"] == "T1078"
     assert 0.0 <= float(rows[0]["attack_probability"]) <= 1.0
 
 
@@ -203,7 +220,7 @@ def test_phase3_api_detects_sessions_from_configured_bundle(tmp_path: Path) -> N
     fastapi = pytest.importorskip("fastapi.testclient")
     bundle_dir = _package_bundle(tmp_path)
     app = create_app(bundle_dir=str(bundle_dir))
-    client = fastapi.TestClient(app)
+    client = _authed_client(fastapi, app)
 
     health = client.get("/health")
     assert health.status_code == 200
@@ -235,6 +252,49 @@ def test_phase3_api_detects_sessions_from_configured_bundle(tmp_path: Path) -> N
     assert payload["threshold"] == 0.0
     assert payload["detections"][0]["session_id"] == "api_s1"
     assert payload["detections"][0]["prediction"] == "attack"
+    assert payload["detections"][0]["model_task"] == "binary_attack_detection"
+    assert payload["detections"][0]["technique_source"] == "none"
+    assert payload["detections"][0]["threshold_source"] == "request_override"
+
+
+def test_phase3_api_requires_api_key_for_protected_routes(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi.testclient")
+    bundle_dir = _package_bundle(tmp_path)
+    app = create_app(bundle_dir=str(bundle_dir))
+    client = fastapi.TestClient(app)
+
+    assert client.get("/health").status_code == 200
+    assert client.get("/ready").status_code == 200
+    assert client.get("/dashboard").status_code == 401
+    assert client.post("/phase3/detect", json={"sessions": []}).status_code == 401
+
+
+def test_phase3_api_accepts_basic_dashboard_auth(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi.testclient")
+    bundle_dir = _package_bundle(tmp_path)
+    app = create_app(bundle_dir=str(bundle_dir))
+    client = fastapi.TestClient(app)
+    token = base64.b64encode(b"argus:test-api-key").decode("ascii")
+
+    response = client.get("/dashboard", headers={"Authorization": f"Basic {token}"})
+
+    assert response.status_code == 200
+
+
+def test_phase3_api_serves_soc_dashboard(tmp_path: Path) -> None:
+    fastapi = pytest.importorskip("fastapi.testclient")
+    bundle_dir = _package_bundle(tmp_path)
+    app = create_app(bundle_dir=str(bundle_dir))
+    client = _authed_client(fastapi, app)
+
+    response = client.get("/dashboard")
+
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert "ARGUS SOC Dashboard" in response.text
+    assert "/phase3/alerts" in response.text
+    assert "/phase3/ueba/risks/" in response.text
+    assert "innerHTML" not in response.text
 
 
 def test_phase3_api_accepts_env_threshold_override(
@@ -253,7 +313,7 @@ def test_phase3_api_exposes_and_clears_ueba_risks(tmp_path: Path) -> None:
     fastapi = pytest.importorskip("fastapi.testclient")
     bundle_dir = _package_bundle(tmp_path)
     app = create_app(bundle_dir=str(bundle_dir))
-    client = fastapi.TestClient(app)
+    client = _authed_client(fastapi, app)
 
     detection = client.post(
         "/phase3/detect",
@@ -300,7 +360,10 @@ def test_phase3_api_exposes_and_clears_ueba_risks(tmp_path: Path) -> None:
     assert missing_risk.status_code == 200
     assert missing_risk.json()["exists"] is False
 
-    cleared = client.delete("/phase3/ueba/risks")
+    not_admin = client.delete("/phase3/ueba/risks")
+    assert not_admin.status_code == 403
+
+    cleared = client.delete("/phase3/ueba/risks", headers=ADMIN_HEADERS)
     assert cleared.status_code == 200
     assert cleared.json()["cleared"] == 1
     assert cleared.json()["remaining"] == 0
@@ -313,7 +376,7 @@ def test_phase3_api_lists_and_fetches_alerts(tmp_path: Path) -> None:
     fastapi = pytest.importorskip("fastapi.testclient")
     bundle_dir = _package_bundle(tmp_path)
     app = create_app(bundle_dir=str(bundle_dir), alert_store=InMemoryAlertStore())
-    client = fastapi.TestClient(app)
+    client = _authed_client(fastapi, app)
 
     detection = client.post(
         "/phase3/detect",
@@ -361,7 +424,7 @@ def test_phase3_api_alert_query_requires_configured_store(tmp_path: Path) -> Non
     app = create_app(bundle_dir=str(bundle_dir))
     app.state.alert_store = None
     app.state.elasticsearch_alerts_enabled = False
-    client = fastapi.TestClient(app)
+    client = _authed_client(fastapi, app)
 
     response = client.get("/phase3/alerts")
 

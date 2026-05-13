@@ -62,17 +62,20 @@ def read_classifier_metadata(path: Path) -> dict[str, Any]:
     if not isinstance(checkpoint, dict):
         return {}
     num_classes = checkpoint.get("num_classes")
+    if num_classes is None:
+        num_classes = 2
+    if int(num_classes) != 2:
+        raise ValueError(
+            "This release packages only binary attack-vs-normal classifiers; "
+            f"got num_classes={num_classes!r}"
+        )
     class_names = checkpoint.get("class_names")
     label_to_id = checkpoint.get("label_to_id")
     return {
-        "num_classes": num_classes,
-        "class_names": class_names if isinstance(class_names, list) else None,
-        "label_to_id": label_to_id if isinstance(label_to_id, dict) else None,
-        "model_task": (
-            "mitre_multiclass_classification"
-            if isinstance(num_classes, int) and num_classes > 2
-            else "binary_attack_classification"
-        ),
+        "num_classes": 2,
+        "class_names": class_names if isinstance(class_names, list) else ["normal", "attack"],
+        "label_to_id": label_to_id if isinstance(label_to_id, dict) else {"normal": 0, "attack": 1},
+        "model_task": "binary_attack_detection",
     }
 
 
@@ -111,7 +114,7 @@ def build_metadata(
         "phase": "3",
         "status": status,
         "bundle_format": "argus_phase3_model_bundle_v1",
-        "model_task": classifier_metadata.get("model_task", "binary_attack_classification"),
+        "model_task": classifier_metadata.get("model_task", "binary_attack_detection"),
         "num_classes": classifier_metadata.get("num_classes"),
         "class_names": classifier_metadata.get("class_names"),
         "label_to_id": classifier_metadata.get("label_to_id"),

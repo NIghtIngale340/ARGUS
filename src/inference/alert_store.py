@@ -10,6 +10,9 @@ from src.inference.alert_engine import Alert
 
 
 class AlertStore(Protocol):
+    def ping(self) -> bool:
+        ...
+
     def index_alert(self, alert: Alert, *, extra: dict[str, Any] | None = None) -> str:
         ...
 
@@ -34,6 +37,9 @@ class InMemoryAlertStore:
 
     def __init__(self) -> None:
         self.alerts: list[dict[str, Any]] = []
+
+    def ping(self) -> bool:
+        return True
 
     def index_alert(self, alert: Alert, *, extra: dict[str, Any] | None = None) -> str:
         document = alert.to_dict()
@@ -84,6 +90,7 @@ class ElasticsearchAlertStore:
         client: Any | None = None,
         index_prefix: str = "argus-alerts",
         request_timeout: float = 5.0,
+        max_retries: int = 1,
     ) -> None:
         if client is None:
             if not elasticsearch_url:
@@ -95,6 +102,10 @@ class ElasticsearchAlertStore:
             client = Elasticsearch(elasticsearch_url, request_timeout=request_timeout)
         self.client = client
         self.index_prefix = index_prefix.rstrip("-")
+        self.max_retries = max(int(max_retries), 0)
+
+    def ping(self) -> bool:
+        return bool(self.client.ping()) if hasattr(self.client, "ping") else True
 
     def index_alert(self, alert: Alert, *, extra: dict[str, Any] | None = None) -> str:
         document = alert.to_dict()
@@ -105,11 +116,19 @@ class ElasticsearchAlertStore:
             tz=timezone.utc,
         ).isoformat()
         index_name = self.index_for_timestamp(float(alert.timestamp))
-        response = self.client.index(
-            index=index_name,
-            id=alert.alert_id,
-            document=document,
-        )
+        last_error: Exception | None = None
+        for _ in range(self.max_retries + 1):
+            try:
+                response = self.client.index(
+                    index=index_name,
+                    id=alert.alert_id,
+                    document=document,
+                )
+                break
+            except Exception as exc:
+                last_error = exc
+        else:
+            raise RuntimeError(f"failed to index alert into Elasticsearch: {last_error}") from last_error
         return str(response.get("_id", alert.alert_id)) if isinstance(response, dict) else str(alert.alert_id)
 
     def index_for_timestamp(self, timestamp: float) -> str:

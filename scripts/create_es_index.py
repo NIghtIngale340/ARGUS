@@ -70,6 +70,12 @@ INDEX_TEMPLATES = {
                     "attack_probability": {"type": "double"},
                     "technique_probability": {"type": "double"},
                     "technique_id": {"type": "keyword"},
+                    "technique_source": {"type": "keyword"},
+                    "fallback_technique_id": {"type": "keyword"},
+                    "threshold": {"type": "double"},
+                    "threshold_source": {"type": "keyword"},
+                    "model_task": {"type": "keyword"},
+                    "alert_persistence_status": {"type": "keyword"},
                     "classification": {"type": "keyword"},
                     "classification_confidence": {"type": "double"},
                     "user_risk": {"type": "double"},
@@ -79,36 +85,7 @@ INDEX_TEMPLATES = {
                     "is_anomaly": {"type": "boolean"},
                     "raw_message": {"type": "text"},
                     "template_id": {"type": "keyword"},
-                    "mitre": {
-                        "type": "object",
-                        "properties": {
-                            "tactic": {"type": "keyword"},
-                            "technique": {"type": "keyword"},
-                            "technique_id": {"type": "keyword"},
-                        },
-                    },
                     "model_version": {"type": "keyword"},
-                },
-            },
-        },
-    },
-
-    "risk-profiles": {
-        "index_patterns": ["risk-profiles-*"],
-        "template": {
-            "settings": {
-                "number_of_shards": 1,
-                "number_of_replicas": 0,
-                "refresh_interval": "10s",
-            },
-            "mappings": {
-                "properties": {
-                    "entity_id": {"type": "keyword"},
-                    "entity_type": {"type": "keyword"},
-                    "risk_score": {"type": "double"},
-                    "anomaly_count": {"type": "integer"},
-                    "last_seen": {"type": "date"},
-                    "updated_at": {"type": "date"},
                 },
             },
         },
@@ -140,7 +117,7 @@ def create_index_templates():
 
 def main():
     print("=" * 60)
-    print("  ARGUS — Elasticsearch Index Template Provisioning")
+    print("  ARGUS - Elasticsearch Index Template Provisioning")
     print("=" * 60)
     print()
 

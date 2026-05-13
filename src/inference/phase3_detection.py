@@ -29,14 +29,21 @@ DETECTION_FIELDNAMES = [
     "user_id",
     "host_id",
     "replay_run_id",
+    "model_task",
     "attack_probability",
     "prediction",
     "technique_id",
+    "technique_source",
+    "fallback_technique_id",
     "technique_probability",
     "threshold",
+    "threshold_source",
     "alert_generated",
     "alert_class",
     "composite_severity",
+    "alert_persistence_status",
+    "alert_store_id",
+    "alert_persistence_error",
 ]
 DETECTION_METADATA_FIELDS = ("replay_run_id",)
 
@@ -137,6 +144,20 @@ def load_threshold(thresholds_path: Path, override: float | None) -> float:
     return float(threshold)
 
 
+def infer_model_task(metadata: dict[str, Any], class_names: list[str]) -> str:
+    """Return an honest model task label for runtime output."""
+    task = str(metadata.get("model_task") or "").strip()
+    binary_tasks = {"", "binary_attack_classification", "binary_attack_detection"}
+    if task not in binary_tasks:
+        raise ValueError(
+            "This ARGUS release only supports binary attack-vs-normal bundles; "
+            f"unsupported model_task={task!r}"
+        )
+    if len(class_names) != 2:
+        raise ValueError("This ARGUS release only supports two classifier classes")
+    return "binary_attack_detection"
+
+
 def load_classifier(classifier_path: Path, device: torch.device) -> ARGUSClassifier:
     checkpoint = torch.load(classifier_path, map_location="cpu", weights_only=False)
     config = checkpoint.get("config")
@@ -144,6 +165,10 @@ def load_classifier(classifier_path: Path, device: torch.device) -> ARGUSClassif
         config = ArgusBertConfig()
 
     num_classes = int(checkpoint.get("num_classes", 2))
+    if num_classes != 2:
+        raise ValueError(
+            "This ARGUS release only supports binary attack-vs-normal classifiers"
+        )
     model = ARGUSClassifier(
         config=config,
         num_classes=num_classes,
@@ -156,12 +181,8 @@ def load_classifier(classifier_path: Path, device: torch.device) -> ARGUSClassif
     class_names = checkpoint.get("class_names")
     if isinstance(class_names, list) and len(class_names) == num_classes:
         model.class_names = [str(class_name) for class_name in class_names]
-    elif num_classes == 2:
-        model.class_names = ["normal", "attack"]
     else:
-        model.class_names = ["normal"] + [
-            f"class_{index}" for index in range(1, num_classes)
-        ]
+        model.class_names = ["normal", "attack"]
     label_to_id = checkpoint.get("label_to_id")
     if isinstance(label_to_id, dict):
         model.label_to_id = {str(key): int(value) for key, value in label_to_id.items()}
@@ -246,7 +267,8 @@ class Phase3DetectionService:
         max_seq_len: int | None = None,
         anomaly_ceiling: float = 15.0,
         dedup_window_secs: float = 0.0,
-        technique_id: str = "T1078",
+        technique_id: str | None = None,
+        threshold_source: str | None = None,
         risk_store: RiskStore | None = None,
         redis_url: str | None = None,
         redis_key_prefix: str = "argus:ueba",
@@ -260,10 +282,13 @@ class Phase3DetectionService:
             else {}
         )
         self.threshold = load_threshold(paths.thresholds, threshold)
+        self.threshold_source = threshold_source or (
+            "env_override" if threshold is not None else "bundle"
+        )
         self.device = select_device(device)
         self.max_seq_len = int(max_seq_len or self.metadata.get("max_seq_len") or 16)
         self.anomaly_ceiling = anomaly_ceiling
-        self.technique_id = technique_id
+        self.fallback_technique_id = technique_id
         self.model = load_classifier(paths.classifier, self.device)
         self.class_names = list(getattr(self.model, "class_names", ["normal", "attack"]))
         self.label_to_id = dict(
@@ -273,6 +298,7 @@ class Phase3DetectionService:
                 {class_name: index for index, class_name in enumerate(self.class_names)},
             )
         )
+        self.model_task = infer_model_task(self.metadata, self.class_names)
         self.tokenizer = LogTokenizer(paths.vocab, max_len=self.max_seq_len)
         if risk_store is None and redis_url:
             risk_store = RedisUEBARiskStore(
@@ -336,6 +362,7 @@ class Phase3DetectionService:
         sessions: Iterable[Mapping[str, Any]],
         *,
         threshold: float | None = None,
+        threshold_source: str | None = None,
         technique_id: str | None = None,
     ) -> list[dict[str, Any]]:
         items = [
@@ -347,6 +374,7 @@ class Phase3DetectionService:
         return self.score_items(
             items,
             threshold=threshold,
+            threshold_source=threshold_source,
             technique_id=technique_id,
         )
 
@@ -355,11 +383,15 @@ class Phase3DetectionService:
         batch: list[dict[str, Any]],
         *,
         threshold: float | None = None,
+        threshold_source: str | None = None,
         technique_id: str | None = None,
     ) -> list[dict[str, Any]]:
         active_threshold = self.threshold if threshold is None else threshold
         if not 0.0 <= active_threshold <= 1.0:
             raise ValueError("threshold must be in [0, 1]")
+        active_threshold_source = threshold_source or (
+            "request_override" if threshold is not None else self.threshold_source
+        )
 
         input_ids = torch.stack([item["input_ids"] for item in batch]).to(self.device)
         attention_mask = torch.stack(
@@ -371,12 +403,12 @@ class Phase3DetectionService:
             probability_rows = torch.softmax(logits, dim=-1).detach().cpu().tolist()
 
         rows = []
-        active_technique = technique_id or self.technique_id
+        active_fallback_technique = technique_id or self.fallback_technique_id
         for item, probabilities in zip(batch, probability_rows):
             class_decision = self._classify_probabilities(
                 probabilities,
                 threshold=active_threshold,
-                fallback_technique_id=active_technique,
+                fallback_technique_id=active_fallback_technique,
             )
             scored = ScoredSession(
                 session_id=str(item["session_id"]),
@@ -392,14 +424,21 @@ class Phase3DetectionService:
                 "session_id": scored.session_id,
                 "user_id": scored.user_id,
                 "host_id": scored.host_id,
+                "model_task": self.model_task,
                 "attack_probability": float(class_decision["attack_probability"]),
                 "prediction": class_decision["prediction"],
                 "technique_id": class_decision["technique_id"] or "",
+                "technique_source": class_decision["technique_source"],
+                "fallback_technique_id": class_decision["fallback_technique_id"] or "",
                 "technique_probability": float(class_decision["technique_probability"]),
                 "threshold": active_threshold,
+                "threshold_source": active_threshold_source,
                 "alert_generated": alert is not None,
                 "alert_class": alert.alert_class if alert else "",
                 "composite_severity": alert.composite_severity if alert else "",
+                "alert_persistence_status": "not_applicable" if alert is None else "disabled",
+                "alert_store_id": "",
+                "alert_persistence_error": "",
             }
             for field in DETECTION_METADATA_FIELDS:
                 value = item.get(field)
@@ -409,16 +448,25 @@ class Phase3DetectionService:
                 alert_extra = {
                     "attack_probability": row["attack_probability"],
                     "technique_probability": row["technique_probability"],
-                    "model_task": self.metadata.get("model_task", "unknown"),
+                    "model_task": self.model_task,
+                    "technique_source": row["technique_source"],
+                    "fallback_technique_id": row["fallback_technique_id"],
+                    "threshold": row["threshold"],
+                    "threshold_source": row["threshold_source"],
                     "class_names": self.class_names,
                 }
                 for field in DETECTION_METADATA_FIELDS:
                     if field in row:
                         alert_extra[field] = row[field]
-                self.alert_store.index_alert(
-                    alert,
-                    extra=alert_extra,
-                )
+                try:
+                    row["alert_store_id"] = self.alert_store.index_alert(
+                        alert,
+                        extra=alert_extra,
+                    )
+                    row["alert_persistence_status"] = "stored"
+                except Exception as exc:
+                    row["alert_persistence_status"] = "failed"
+                    row["alert_persistence_error"] = str(exc)
             rows.append(row)
         return rows
 
@@ -427,42 +475,27 @@ class Phase3DetectionService:
         probabilities: list[float],
         *,
         threshold: float,
-        fallback_technique_id: str,
+        fallback_technique_id: str | None,
     ) -> dict[str, Any]:
-        """Map classifier probabilities to binary alert + optional MITRE technique."""
+        """Map classifier probabilities to binary release output."""
         if len(probabilities) != len(self.class_names):
             raise ValueError("probability vector does not match classifier class_names")
+        if len(probabilities) != 2:
+            raise ValueError("This ARGUS release only supports binary probabilities")
 
-        normal_index = self.label_to_id.get("normal")
-        if len(probabilities) == 2 and (
-            self.class_names[1] == "attack" or self.class_names[1].startswith("class_")
-        ):
-            attack_probability = float(probabilities[1])
-            is_attack = attack_probability >= threshold
-            return {
-                "prediction": "attack" if is_attack else "normal",
-                "attack_probability": attack_probability,
-                "technique_id": fallback_technique_id if is_attack else None,
-                "technique_probability": attack_probability if is_attack else 0.0,
-                "classification_confidence": attack_probability if is_attack else 0.95,
-            }
-
-        predicted_index = int(max(range(len(probabilities)), key=lambda idx: probabilities[idx]))
-        predicted_class = self.class_names[predicted_index]
-        normal_probability = float(probabilities[normal_index]) if normal_index is not None else 0.0
-        if normal_index is not None:
-            attack_probability = max(0.0, 1.0 - normal_probability)
-        else:
-            attack_probability = float(max(probabilities))
-
-        is_attack = predicted_class != "normal" and attack_probability >= threshold
-        technique_probability = float(probabilities[predicted_index]) if is_attack else 0.0
+        attack_index = self.label_to_id.get("attack", 1)
+        if attack_index not in (0, 1):
+            attack_index = 1
+        attack_probability = float(probabilities[attack_index])
+        is_attack = attack_probability >= threshold
         return {
             "prediction": "attack" if is_attack else "normal",
-            "attack_probability": float(attack_probability),
-            "technique_id": predicted_class if is_attack else None,
-            "technique_probability": technique_probability,
-            "classification_confidence": technique_probability if is_attack else 0.95,
+            "attack_probability": attack_probability,
+            "technique_id": None,
+            "technique_source": "fallback" if is_attack and fallback_technique_id else "none",
+            "fallback_technique_id": fallback_technique_id if is_attack else None,
+            "technique_probability": attack_probability if is_attack else 0.0,
+            "classification_confidence": attack_probability if is_attack else 0.95,
         }
 
 

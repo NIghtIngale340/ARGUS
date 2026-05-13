@@ -1,4 +1,4 @@
-"""ARGUS Phase 3.2 — Fine-tune pre-trained BERT for attack classification.
+"""ARGUS Phase 3.2 fine-tuning for binary attack classification.
 
 Loads the pre-trained MLM checkpoint, attaches a classification head,
 and trains on labeled attack sessions using weighted cross-entropy
@@ -6,10 +6,7 @@ to handle the severe class imbalance (500K normal vs 212 attack).
 """
 
 import argparse
-import csv
 import json
-import os
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,8 +20,6 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 from src.models.attack_classifier import ARGUSClassifier
-from src.models.config import ArgusBertConfig
-from src.training.mitre_dataset import MITREClassificationDataset, collate_mitre_batch
 
 
 class AttackClassificationDataset(Dataset):
@@ -168,59 +163,43 @@ def evaluate(
     n = len(all_labels)
     avg_loss = total_loss / max(n, 1)
 
-    num_classes = int(getattr(model, "num_classes", max(all_labels + all_preds) + 1 if n else 2))
+    tp = sum(
+        1
+        for prediction, label in zip(all_preds, all_labels)
+        if prediction == 1 and label == 1
+    )
+    fp = sum(
+        1
+        for prediction, label in zip(all_preds, all_labels)
+        if prediction == 1 and label == 0
+    )
+    fn = sum(
+        1
+        for prediction, label in zip(all_preds, all_labels)
+        if prediction == 0 and label == 1
+    )
+    tn = sum(
+        1
+        for prediction, label in zip(all_preds, all_labels)
+        if prediction == 0 and label == 0
+    )
 
-    if num_classes == 2:
-        tp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 1)
-        fp = sum(1 for p, l in zip(all_preds, all_labels) if p == 1 and l == 0)
-        fn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 1)
-        tn = sum(1 for p, l in zip(all_preds, all_labels) if p == 0 and l == 0)
-
-        accuracy = (tp + tn) / max(n, 1)
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-
-        return {
-            "loss": avg_loss,
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "macro_f1": f1,
-            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
-        }
-
-    per_class = []
-    for class_id in range(num_classes):
-        tp = sum(1 for p, l in zip(all_preds, all_labels) if p == class_id and l == class_id)
-        fp = sum(1 for p, l in zip(all_preds, all_labels) if p == class_id and l != class_id)
-        fn = sum(1 for p, l in zip(all_preds, all_labels) if p != class_id and l == class_id)
-        precision = tp / max(tp + fp, 1)
-        recall = tp / max(tp + fn, 1)
-        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-        support = sum(1 for label in all_labels if label == class_id)
-        per_class.append({
-            "class_id": class_id,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "support": support,
-        })
-
-    accuracy = sum(1 for p, l in zip(all_preds, all_labels) if p == l) / max(n, 1)
-    macro_precision = float(np.mean([row["precision"] for row in per_class]))
-    macro_recall = float(np.mean([row["recall"] for row in per_class]))
-    macro_f1 = float(np.mean([row["f1"] for row in per_class]))
+    accuracy = (tp + tn) / max(n, 1)
+    precision = tp / max(tp + fp, 1)
+    recall = tp / max(tp + fn, 1)
+    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
 
     return {
         "loss": avg_loss,
         "accuracy": accuracy,
-        "precision": macro_precision,
-        "recall": macro_recall,
-        "f1": macro_f1,
-        "macro_f1": macro_f1,
-        "per_class": per_class,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "macro_f1": f1,
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
     }
 
 
@@ -324,7 +303,7 @@ def train(
                 "best_f1": best_f1,
                 "val_metrics": val_metrics,
             }, ckpt_path)
-            print(f"  ✓ New best F1={best_f1:.4f}, saved → {ckpt_path}")
+            print(f"  [OK] New best F1={best_f1:.4f}, saved -> {ckpt_path}")
         else:
             patience_counter += 1
             if patience_counter >= cfg.patience:
@@ -333,7 +312,7 @@ def train(
 
     history_path = output_dir / "finetune_history.json"
     history_path.write_text(json.dumps(history, indent=2))
-    print(f"Training history → {history_path}")
+    print(f"Training history -> {history_path}")
 
     return {"best_f1": best_f1, "epochs_trained": epoch + 1, "history": history}
 
@@ -342,16 +321,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune ARGUS-BERT for attack classification")
     parser.add_argument("--normal-manifest", help="Path to normal sessions manifest .pt")
     parser.add_argument("--attack-manifest", help="Path to attack sessions manifest .pt")
-    parser.add_argument("--mitre-manifest", help="Tokenized manifest for MITRE label-driven training")
-    parser.add_argument("--mitre-labels", help="MITRE labels JSONL/CSV from validate_mitre_labels.py")
-    parser.add_argument("--mitre-train-split", default="train")
-    parser.add_argument("--mitre-val-split", default="val")
-    parser.add_argument(
-        "--class-name",
-        action="append",
-        dest="class_names",
-        help="Explicit class name order. Repeat, e.g. normal, T1078, T1021.",
-    )
     parser.add_argument("--checkpoint", required=True, help="Path to pre-trained MLM checkpoint .pt")
     parser.add_argument("--out", required=True, help="Output directory for fine-tuned model")
     parser.add_argument("--epochs", type=int, default=20)
@@ -367,59 +336,35 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    mitre_mode = bool(args.mitre_labels or args.mitre_manifest)
-    class_names = args.class_names
     num_classes = 2
 
-    if mitre_mode:
-        if not args.mitre_labels or not args.mitre_manifest:
-            raise ValueError("--mitre-labels and --mitre-manifest must be provided together")
-        train_dataset = MITREClassificationDataset(
-            args.mitre_manifest,
-            args.mitre_labels,
-            split=args.mitre_train_split,
-            class_names=class_names,
-            limit_chunks=args.limit_chunks,
-        )
-        val_dataset = MITREClassificationDataset(
-            args.mitre_manifest,
-            args.mitre_labels,
-            split=args.mitre_val_split,
-            class_names=train_dataset.class_names,
-            limit_chunks=args.limit_chunks,
-        )
-        labels = train_dataset.labels
-        num_classes = len(train_dataset.class_names)
-        collate = collate_mitre_batch
-        print(f"MITRE classes: {train_dataset.class_names}")
-    else:
-        if not args.normal_manifest or not args.attack_manifest:
-            raise ValueError("--normal-manifest and --attack-manifest are required for binary mode")
-        dataset = AttackClassificationDataset(
-            normal_manifest_path=args.normal_manifest,
-            attack_manifest_path=args.attack_manifest,
-            max_normal=args.max_normal,
-            limit_chunks=args.limit_chunks,
-        )
+    if not args.normal_manifest or not args.attack_manifest:
+        raise ValueError("--normal-manifest and --attack-manifest are required")
+    dataset = AttackClassificationDataset(
+        normal_manifest_path=args.normal_manifest,
+        attack_manifest_path=args.attack_manifest,
+        max_normal=args.max_normal,
+        limit_chunks=args.limit_chunks,
+    )
 
-        labels = dataset.labels
-        attack_indices = [i for i, l in enumerate(labels) if l == 1]
-        normal_indices = [i for i, l in enumerate(labels) if l == 0]
+    labels = dataset.labels
+    attack_indices = [i for i, label in enumerate(labels) if label == 1]
+    normal_indices = [i for i, label in enumerate(labels) if label == 0]
 
-        n_val_attack = max(1, int(len(attack_indices) * args.val_split))
-        n_val_normal = max(1, int(len(normal_indices) * args.val_split))
+    n_val_attack = max(1, int(len(attack_indices) * args.val_split))
+    n_val_normal = max(1, int(len(normal_indices) * args.val_split))
 
-        rng = np.random.RandomState(42)
-        rng.shuffle(attack_indices)
-        rng.shuffle(normal_indices)
+    rng = np.random.RandomState(42)
+    rng.shuffle(attack_indices)
+    rng.shuffle(normal_indices)
 
-        val_indices = attack_indices[:n_val_attack] + normal_indices[:n_val_normal]
-        train_indices = attack_indices[n_val_attack:] + normal_indices[n_val_normal:]
+    val_indices = attack_indices[:n_val_attack] + normal_indices[:n_val_normal]
+    train_indices = attack_indices[n_val_attack:] + normal_indices[n_val_normal:]
 
-        train_dataset = torch.utils.data.Subset(dataset, train_indices)
-        val_dataset = torch.utils.data.Subset(dataset, val_indices)
-        labels = [dataset.labels[i] for i in train_indices]
-        collate = collate_fn
+    train_dataset = torch.utils.data.Subset(dataset, train_indices)
+    val_dataset = torch.utils.data.Subset(dataset, val_indices)
+    labels = [dataset.labels[i] for i in train_indices]
+    collate = collate_fn
 
     print(f"Train: {len(train_dataset):,} | Val: {len(val_dataset):,}")
 
@@ -448,9 +393,6 @@ def main() -> None:
         freeze_layers=args.freeze_layers,
         classifier_dropout=0.1,
     )
-    if mitre_mode:
-        model.class_names = train_dataset.class_names
-        model.label_to_id = train_dataset.label_to_id
     model.load_pretrained_bert(args.checkpoint)
     print("Loaded pre-trained BERT weights.")
 
@@ -468,7 +410,7 @@ def main() -> None:
 
     summary_path = output_dir / "finetune_summary.json"
     summary_path.write_text(json.dumps(train_result, indent=2))
-    print(f"Summary → {summary_path}")
+    print(f"Summary -> {summary_path}")
 
 
 if __name__ == "__main__":

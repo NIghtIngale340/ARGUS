@@ -1,4 +1,4 @@
-"""ARGUS Phase 3.3 + 3.4 — Alert engine with composite severity and UEBA risk.
+"""ARGUS Phase 3.3 + 3.4 alert engine with composite severity and UEBA risk.
 
 Combines:
 - MLM anomaly score (unsupervised)
@@ -14,6 +14,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional, Protocol
+from uuid import uuid4
 
 import numpy as np
 
@@ -41,7 +42,7 @@ class Alert:
 
 @dataclass
 class ScoredSession:
-    """Input to the alert engine — a session that has been scored."""
+    """Input to the alert engine: a session that has been scored."""
     session_id: str
     user_id: str
     host_id: str
@@ -402,7 +403,7 @@ class AlertEngine:
             return None
 
         self._alert_counter += 1
-        alert_id = f"alert_{self._alert_counter:06d}"
+        alert_id = f"alert_{uuid4().hex}"
 
         alert = Alert(
             alert_id=alert_id,
@@ -449,7 +450,7 @@ class AlertEngine:
 def save_alerts_to_csv(alerts: list[Alert], output_path: str) -> None:
     """Save alerts to CSV."""
     if not alerts:
-        print(f"No alerts to save.")
+        print("No alerts to save.")
         return
 
     import csv
@@ -464,4 +465,4 @@ def save_alerts_to_csv(alerts: list[Alert], output_path: str) -> None:
         for alert in alerts:
             writer.writerow(alert.to_dict())
 
-    print(f"Saved {len(alerts)} alerts → {output_path}")
+    print(f"Saved {len(alerts)} alerts -> {output_path}")

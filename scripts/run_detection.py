@@ -46,7 +46,13 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="auto", choices=("auto", "cpu", "cuda"))
     parser.add_argument("--max-seq-len", type=int)
-    parser.add_argument("--technique-id", default="T1078")
+    parser.add_argument(
+        "--technique-id",
+        help=(
+            "Optional fallback technique ID for binary attack detections. "
+            "This is labeled as fallback metadata, not real MITRE classifier output."
+        ),
+    )
     parser.add_argument("--anomaly-ceiling", type=float, default=15.0)
     parser.add_argument("--dedup-window-secs", type=float, default=0.0)
     parser.add_argument("--redis-url", help="Use Redis-backed UEBA risk state")
@@ -71,6 +77,7 @@ def main(args: Namespace | None = None) -> None:
     service = Phase3DetectionService(
         paths,
         threshold=parsed.threshold,
+        threshold_source="cli_override" if parsed.threshold is not None else None,
         device=parsed.device,
         max_seq_len=parsed.max_seq_len,
         anomaly_ceiling=parsed.anomaly_ceiling,

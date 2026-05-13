@@ -17,8 +17,11 @@ from typing import Any, Iterable
 from uuid import uuid4
 
 from src.inference.kafka_consumer import (
+    DEFAULT_DEAD_LETTER_TOPIC,
     DEFAULT_DETECTIONS_TOPIC,
     DEFAULT_RAW_TOPIC,
+    PendingDetection,
+    StreamingSessionProcessor,
     create_streaming_processor_from_env,
 )
 
@@ -41,6 +44,10 @@ def build_parser() -> ArgumentParser:
         default=os.getenv("ARGUS_DETECTIONS_TOPIC", DEFAULT_DETECTIONS_TOPIC),
     )
     parser.add_argument(
+        "--dead-letter-topic",
+        default=os.getenv("ARGUS_DEAD_LETTER_TOPIC", DEFAULT_DEAD_LETTER_TOPIC),
+    )
+    parser.add_argument(
         "--group-id",
         default=os.getenv("ARGUS_PHASE4_CONSUMER_GROUP", "argus-phase4-consumer"),
     )
@@ -48,6 +55,8 @@ def build_parser() -> ArgumentParser:
     parser.add_argument("--poll-timeout", type=float, default=1.0)
     parser.add_argument("--duration-seconds", type=float)
     parser.add_argument("--max-events", type=int)
+    parser.add_argument("--max-errors", type=int, default=int(os.getenv("ARGUS_MAX_STREAM_ERRORS", "1000")))
+    parser.add_argument("--score-batch-size", type=int, default=int(os.getenv("ARGUS_SCORE_BATCH_SIZE", "16")))
     parser.add_argument("--skip-topic-create", action="store_true")
     parser.add_argument("--topic-ready-timeout", type=float, default=60.0)
     return parser
@@ -125,6 +134,10 @@ def run_consumer(args: Namespace) -> dict[str, int]:
         raise ValueError("--duration-seconds must be > 0")
     if args.max_events is not None and args.max_events <= 0:
         raise ValueError("--max-events must be > 0")
+    if args.max_errors is not None and args.max_errors <= 0:
+        raise ValueError("--max-errors must be > 0")
+    if args.score_batch_size <= 0:
+        raise ValueError("--score-batch-size must be > 0")
     if args.topic_ready_timeout <= 0:
         raise ValueError("--topic-ready-timeout must be > 0")
 
@@ -143,7 +156,7 @@ def run_consumer(args: Namespace) -> dict[str, int]:
     if not args.skip_topic_create:
         ensure_topics_exist(
             bootstrap=bootstrap,
-            topics=[args.raw_topic, args.detections_topic],
+            topics=[args.raw_topic, args.detections_topic, args.dead_letter_topic],
             timeout_seconds=float(args.topic_ready_timeout),
         )
 
@@ -167,7 +180,8 @@ def run_consumer(args: Namespace) -> dict[str, int]:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    stats = {"events": 0, "detections": 0, "errors": 0}
+    stats = {"events": 0, "detections": 0, "errors": 0, "dead_letters": 0}
+    pending: list[PendingDetection] = []
     deadline = (
         time.monotonic() + float(args.duration_seconds)
         if args.duration_seconds is not None
@@ -202,31 +216,130 @@ def run_consumer(args: Namespace) -> dict[str, int]:
                 raise KafkaException(msg.error())
 
             try:
-                payload = json.loads(msg.value().decode("utf-8"))
+                raw_value = msg.value().decode("utf-8")
+                payload = json.loads(raw_value)
                 if not isinstance(payload, dict):
                     raise ValueError("Kafka event payload must be a JSON object")
                 stats["events"] += 1
-                for detection in processor.process_event(payload):
-                    producer.produce(
-                        args.detections_topic,
-                        value=json.dumps(detection, sort_keys=True).encode("utf-8"),
-                        key=str(detection.get("session_id", "")).encode("utf-8"),
+                completed = processor.process_event_to_item(payload)
+                if completed is not None:
+                    pending.append(completed)
+                if len(pending) >= args.score_batch_size:
+                    _flush_pending_detections(
+                        pending,
+                        processor=processor,
+                        producer=producer,
+                        detections_topic=args.detections_topic,
+                        stats=stats,
                     )
-                    producer.poll(0)
-                    stats["detections"] += 1
             except Exception as exc:
                 stats["errors"] += 1
-                print(f"[ERROR] failed to process message: {exc}", file=sys.stderr, flush=True)
+                _produce_dead_letter(
+                    producer,
+                    topic=args.dead_letter_topic,
+                    error=exc,
+                    message=msg,
+                    stats=stats,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "event": "stream_message_failed",
+                            "error": str(exc),
+                            "errors": stats["errors"],
+                        },
+                        sort_keys=True,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+                if args.max_errors is not None and stats["errors"] >= args.max_errors:
+                    print(
+                        f"[FATAL] max stream errors reached: {stats['errors']}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    break
     finally:
+        if pending:
+            _flush_pending_detections(
+                pending,
+                processor=processor,
+                producer=producer,
+                detections_topic=args.detections_topic,
+                stats=stats,
+            )
         producer.flush()
         consumer.close()
 
     print(
         f"Stopped. events={stats['events']} detections={stats['detections']} "
-        f"errors={stats['errors']}",
+        f"errors={stats['errors']} dead_letters={stats['dead_letters']}",
         flush=True,
     )
     return stats
+
+
+def _flush_pending_detections(
+    pending: list[PendingDetection],
+    *,
+    processor: StreamingSessionProcessor,
+    producer: Any,
+    detections_topic: str,
+    stats: dict[str, int],
+) -> None:
+    if not pending:
+        return
+    batch = list(pending)
+    pending.clear()
+    rows = processor.detector.score_items([item.item for item in batch])
+    for row, pending_item in zip(rows, batch):
+        detection = processor._annotate_detection(
+            row,
+            pending_item.token_ids,
+            pending_item.source_event,
+        )
+        producer.produce(
+            detections_topic,
+            value=json.dumps(detection, sort_keys=True).encode("utf-8"),
+            key=str(detection.get("session_id", "")).encode("utf-8"),
+        )
+        producer.poll(0)
+        stats["detections"] += 1
+
+
+def _produce_dead_letter(
+    producer: Any,
+    *,
+    topic: str,
+    error: Exception,
+    message: Any,
+    stats: dict[str, int],
+) -> None:
+    raw_value = ""
+    try:
+        value = message.value()
+        raw_value = value.decode("utf-8", errors="replace") if value else ""
+    except Exception:
+        raw_value = ""
+    payload = {
+        "error": str(error),
+        "error_type": type(error).__name__,
+        "raw_value": raw_value,
+        "source_topic": getattr(message, "topic", lambda: "")(),
+        "source_partition": getattr(message, "partition", lambda: None)(),
+        "source_offset": getattr(message, "offset", lambda: None)(),
+        "timestamp": time.time(),
+    }
+    try:
+        parsed = json.loads(raw_value) if raw_value else None
+        if isinstance(parsed, dict) and parsed.get("replay_run_id"):
+            payload["replay_run_id"] = str(parsed["replay_run_id"])
+    except Exception:
+        pass
+    producer.produce(topic, value=json.dumps(payload, sort_keys=True).encode("utf-8"))
+    producer.poll(0)
+    stats["dead_letters"] += 1
 
 
 def main(args: Namespace | None = None) -> int:

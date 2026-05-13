@@ -8,13 +8,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 import sys
 import time
 
-import pandas as pd
-import pyarrow.parquet as pq
-
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
+# On Windows, importing pyarrow before torch can make torch DLL loading fail in
+# fresh subprocesses. Import ARGUS tokenizer first so torch initializes itself.
 from src.parsing.log_tokenizer import LogTokenizer
 from src.parsing.vocab_builder import VocabBuilder, build_event_token
+
+import pyarrow.parquet as pq
 
 SPLIT_DAY_RANGES = {
     "train": (1, 40),

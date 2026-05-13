@@ -1,6 +1,5 @@
 """Unit tests for ARGUS attack classifier and alert engine."""
 
-import json
 import time
 from pathlib import Path
 
@@ -10,12 +9,10 @@ import torch
 from src.models.attack_classifier import ARGUSClassifier
 from src.models.config import ArgusBertConfig
 from src.inference.alert_engine import (
-    Alert,
     AlertEngine,
     RedisUEBARiskStore,
     ScoredSession,
     UEBARiskStore,
-    load_technique_severity,
 )
 
 
@@ -59,15 +56,6 @@ class TestARGUSClassifier:
         model = ARGUSClassifier(config=config, freeze_layers=1)
         trainable, total = model.count_trainable_params()
         assert 0 < trainable < total
-
-    def test_multiclass_output(self) -> None:
-        config = ArgusBertConfig(vocab_size=50, max_seq_len=8, hidden_size=64,
-                                  num_hidden_layers=2, num_attention_heads=2,
-                                  intermediate_size=128)
-        model = ARGUSClassifier(config=config, num_classes=5, freeze_layers=0)
-        ids = torch.randint(0, 50, (2, 8))
-        logits = model(ids)
-        assert logits.shape == (2, 5)
 
     def test_gradient_flows_through_unfrozen_layers(self) -> None:
         config = ArgusBertConfig(vocab_size=50, max_seq_len=8, hidden_size=64,

@@ -1,18 +1,49 @@
-data/
-checkpoints/
+# Local environment and secrets
 .env
-__pycache__/
-*.pyc
+.env.*
+!.env.example
 .venv/
+venv/
+
+# Generated data, models, and runtime outputs
+/data/
+/checkpoints/
+/models/
+/reports/
+/certs/
+/mlruns/
 *.pt
 *.ckpt
-mlruns/
-*.log
+*.parquet
+*.jsonl
+*.csv.tmp
+*.zip
 
-# Common Poetry and test artifacts
+# Python caches and build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.ipynb_checkpoints/
+.coverage
+coverage.xml
+htmlcov/
 build/
 dist/
+*.egg-info/
+
+# Notebook and editor noise
+.ipynb_checkpoints/
+.DS_Store
+Thumbs.db
+
+# IDE and tool directories
+.vscode/
+.idea/
+.gemini/
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak

@@ -1,5 +1,4 @@
-"""
-ARGUS — Centralized Configuration Layer
+"""ARGUS centralized configuration layer.
 
 Pydantic-settings based config singleton. Reads environment variables
 (case-insensitive) with .env file fallback. Fails fast on missing values.
@@ -30,13 +29,13 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Required — no defaults
+    # Required: no defaults.
     es_url: str = Field(..., description="Elasticsearch cluster URL")
     kafka_bootstrap: str = Field(..., description="Kafka bootstrap server(s)")
     redis_url: str = Field(..., description="Redis connection URL")
     mlflow_uri: str = Field(..., description="MLflow tracking URI")
 
-    # Optional — sensible defaults
+    # Optional: sensible defaults.
     model_name: str = Field(default="logbert_v1", description="Active model name in MLflow")
     log_level: str = Field(default="INFO", description="Logging verbosity")
     env: Environment = Field(default=Environment.development, description="Runtime environment")

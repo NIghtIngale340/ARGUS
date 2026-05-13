@@ -13,7 +13,6 @@ from argparse import ArgumentParser, Namespace
 from pathlib import Path
 import sys
 
-import numpy as np
 import pandas as pd
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
@@ -74,7 +73,7 @@ def main(args: Namespace | None = None) -> None:
               f"{result.operational_threshold:.6f}")
 
     out_path = save_thresholds(result, parsed.out)
-    print(f"\n--- Calibration Summary ---")
+    print("\n--- Calibration Summary ---")
     print(f"  Sessions:  {result.count:,}")
     print(f"  Mean:      {result.mean:.6f}")
     print(f"  Std:       {result.std:.6f}")
@@ -87,7 +86,7 @@ def main(args: Namespace | None = None) -> None:
     vals = list(result.percentiles.values())
     unique = len(set(vals))
     if unique < len(vals):
-        print(f"\n⚠  {len(vals) - unique} duplicate threshold(s) detected.")
+        print(f"\n[WARN] {len(vals) - unique} duplicate threshold(s) detected.")
 
     print(f"\nSaved to {out_path}")
 

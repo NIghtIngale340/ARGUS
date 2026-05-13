@@ -1,6 +1,6 @@
-"""ARGUS attack classifier — classification head on pre-trained BERT."""
+"""ARGUS attack classifier with a classification head on pre-trained BERT."""
 
-from typing import Any, Optional
+from typing import Optional
 
 import torch
 from torch import nn, Tensor
@@ -13,10 +13,10 @@ class ARGUSClassifier(nn.Module):
     """Pre-trained BERT + classification head on [CLS] token.
 
     Architecture:
-        session tokens → BERT encoder (bottom layers frozen)
-        → [CLS] hidden state (256-dim)
-        → Dropout → Linear(256, num_classes)
-        → logits
+        session tokens -> BERT encoder (bottom layers frozen)
+        -> [CLS] hidden state (256-dim)
+        -> Dropout -> Linear(256, num_classes)
+        -> logits
     """
 
     def __init__(
@@ -71,7 +71,7 @@ class ARGUSClassifier(nn.Module):
         input_ids: Tensor,
         attention_mask: Optional[Tensor] = None,
     ) -> Tensor:
-        """Forward pass: tokens → class logits.
+        """Forward pass: tokens to class logits.
 
         Args:
             input_ids: (B, T) token ID tensor.

@@ -1,14 +1,12 @@
 """Unit tests for src.inference.thresholds."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from src.inference.thresholds import (
-    ThresholdResult,
     calibrate_thresholds,
     classify_sessions,
     load_thresholds,
@@ -25,7 +23,7 @@ class TestCalibrateThresholds:
         assert abs(result.mean - 50.5) < 0.01
         assert result.min_score == 1.0
         assert result.max_score == 100.0
-        # p50 of 1..100 ≈ 50.5
+        # p50 of 1..100 is about 50.5
         assert 49 <= result.percentiles["p50"] <= 51
 
     def test_custom_percentiles(self):
